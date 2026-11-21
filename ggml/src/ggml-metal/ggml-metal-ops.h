@@ -98,6 +98,7 @@ int ggml_metal_op_situ_fused        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ctrl_mix_fused    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_sconv_fused       (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_sconv_dyn_fused   (ggml_metal_op_t ctx, int idx, int n);
+int ggml_metal_op_row_store_fused   (ggml_metal_op_t ctx, int idx, int n, int mode);
 int ggml_metal_op_relpos_fused      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mix_tail_fused    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gate_mul_fused    (ggml_metal_op_t ctx, int idx);

@@ -775,6 +775,21 @@ typedef struct {
 } ggml_metal_kargs_sconv_dyn;
 
 typedef struct {
+    int32_t  nl;      // float4 per head row
+    int32_t  mode;    // 0: L2 clip, 1: rms_norm
+    uint64_t nb1;     // value strides: head, token
+    uint64_t nb2;
+    uint64_t nbd1;    // cache row stride
+    uint64_t nbi0;    // index stride
+    int32_t  idx_i64;
+    float    sc;      // clip: SCALE scale, bias, FILL value, CLAMP bounds; rms_norm: eps in sc, row size in bi
+    float    bi;
+    float    thr;
+    float    lo;
+    float    hi;
+} ggml_metal_kargs_row_store;
+
+typedef struct {
     int32_t  NR;    // relative features
     int32_t  H;
     int32_t  NK;    // kv cells

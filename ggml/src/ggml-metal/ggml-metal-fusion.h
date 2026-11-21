@@ -54,6 +54,8 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MIX_TAIL,     // CONT + MUL_MAT + SOFT_MAX + MUL_MAT: scores product, then softmax-weighted sum
     GGML_METAL_FUSION_GATE_MUL,     // UNARY(sigmoid) + MUL
     GGML_METAL_FUSION_SCONV_DYN,    // short conv with 4 input-dependent taps per head (17 ops)
+    GGML_METAL_FUSION_CLIP_STORE,   // row L2 clip (no scale) + VIEW + SET_ROWS (K into the f16 cache)
+    GGML_METAL_FUSION_NORM_STORE,   // RMS_NORM (no weight) + VIEW + SET_ROWS (V into the f16 cache)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

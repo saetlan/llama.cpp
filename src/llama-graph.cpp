@@ -3813,14 +3813,6 @@ static ggml_tensor * build_attn_iswa_impl(
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
 
-    if (k_cur) {
-        ggml_build_forward_expand(gf, k_cur);
-    }
-
-    if (v_cur) {
-        ggml_build_forward_expand(gf, v_cur);
-    }
-
     // whole seq fits into batch in training mode
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
     if (use_kv_cur) {
@@ -3829,11 +3821,20 @@ static ggml_tensor * build_attn_iswa_impl(
 
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
 
+    // each store right after its value (Metal fuses the store into the producing kernel)
+    if (k_cur) {
+        ggml_build_forward_expand(gf, k_cur);
+    }
+
     // optionally store to KV cache
     if (store_kv && k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    }
+
+    if (v_cur) {
+        ggml_build_forward_expand(gf, v_cur);
     }
 
     if (store_kv && v_cur) {

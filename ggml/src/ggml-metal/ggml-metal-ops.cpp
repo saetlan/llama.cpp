@@ -842,6 +842,10 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_clip_rows_fused(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_STORE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_row_store_fused(ctx, idx, n, 0);
+        }
     }
 
     // inkling2 control blend anchors at the forget TANH
@@ -4720,6 +4724,15 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
+    if (ctx->node(idx)->op == GGML_OP_RMS_NORM && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_STORE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_row_store_fused(ctx, idx, n, 1);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -5561,6 +5574,59 @@ int ggml_metal_op_gate_mul_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, (args.n4 + nth - 1)/nth, 1, 1, nth, 1, 1);
 
     return 2;
+}
+
+// K clip (mode 0, 9 nodes) or V rms_norm (mode 1, 2 nodes) + cache store; idx is the SQR / RMS_NORM
+int ggml_metal_op_row_store_fused(ggml_metal_op_t ctx, int idx, int n, int mode) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * first = ctx->node(idx);
+    const ggml_tensor * sr    = ctx->node(idx + n - 1);
+    const ggml_tensor * x     = first->src[0];
+    const ggml_tensor * idxs  = sr->src[1];
+    const ggml_tensor * cache = sr->src[2];
+
+    for (int i = 1; i < n; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_row_store args = {};
+    args.nl      = (int32_t) (x->ne[0]/4);
+    args.mode    = mode;
+    args.nb1     = x->nb[1];
+    args.nb2     = x->nb[2];
+    args.nbd1    = cache->nb[1];
+    args.nbi0    = idxs->nb[0];
+    args.idx_i64 = idxs->type == GGML_TYPE_I64 ? 1 : 0;
+    if (mode == 0) {
+        const ggml_tensor * sc   = ctx->node(idx + 3);
+        const ggml_tensor * fill = ctx->node(idx + 4);
+        const ggml_tensor * clmp = ctx->node(idx + 6);
+        args.sc  = ggml_get_op_params_f32(sc, 0);
+        args.bi  = ggml_get_op_params_f32(sc, 1);
+        args.thr = ggml_get_op_params_f32(fill, 0);
+        args.lo  = ggml_get_op_params_f32(clmp, 0);
+        args.hi  = ggml_get_op_params_f32(clmp, 1);
+    } else {
+        float eps;
+        memcpy(&eps, first->op_params, sizeof(float));
+        args.sc = eps;
+        args.bi = (float) x->ne[0];
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_by_name(lib, "kernel_row_store_f32_f16"));
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),     1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(idxs),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cache), 3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, x->ne[1], x->ne[2], 1, std::min(32, (int) args.nl), 1, 1);
+
+    return n;
 }
 
 // dynamic-tap short conv at one token; idx is the CONCAT, n the group size (17)

@@ -594,6 +594,46 @@ kernel void kernel_sconv_par_f32(
 }
 
 // one token, dynamic taps: out = (cur + (conv + sum_lag x[3-lag]*tap[lag, head]))*sc, in the unfused rounding order
+// K clip or V rms_norm of one head row (one SIMD group), written as f16 into the cache row of its token:
+// same reductions as kernel_sum_rows_f32_f32_4 / kernel_rms_norm_fuse_impl<float4,1>, then the set_rows cast
+kernel void kernel_row_store_f32_f16(
+        constant ggml_metal_kargs_row_store & args,
+        device const char * src,
+        device const char * idxs,
+        device       char * cache,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int h = tgpig.x;
+    const int t = tgpig.y;
+
+    float4 x = float4(0.0f);
+    if (tiisg < args.nl) {
+        x = ((device const float4 *) (src + h*args.nb1 + t*args.nb2))[tiisg];
+    }
+
+    float4 y;
+    if (args.mode == 0) {
+        float4 s = simd_sum(x * x);
+        const float nrm = sqrt(sum(s));
+        const float n2  = args.sc * nrm + args.bi;
+        const float c   = clamp(args.thr / n2, args.lo, args.hi);
+        y = x * c;
+    } else {
+        float sumf = 0.0f;
+        sumf += dot(x, x);
+        sumf = simd_sum(sumf);
+        const float mean  = sumf/args.bi;
+        const float scale = 1.0f/sqrt(mean + args.sc);
+        y = x*scale;
+    }
+
+    const int64_t row = args.idx_i64 ? ((device const int64_t *) (idxs + t*args.nbi0))[0]
+                                     : (int64_t) ((device const int32_t *) (idxs + t*args.nbi0))[0];
+    if (tiisg < args.nl) {
+        ((device half4 *) (cache + row*args.nbd1))[h*args.nl + tiisg] = (half4) y;
+    }
+}
+
 kernel void kernel_sconv_dyn_f32(
         constant ggml_metal_kargs_sconv_dyn & args,
         device const char * past,

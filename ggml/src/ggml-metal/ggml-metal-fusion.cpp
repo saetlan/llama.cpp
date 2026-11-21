@@ -952,6 +952,107 @@ static bool ggml_metal_fusion_check_sconv_dyn(
     return true;
 }
 
+// common tail of the store fusions: nodes[k] is the SET_ROWS writing the rows of `val` (via a 2D VIEW) into an f16
+// cache at the given row indices; every raw node in [r0, r1] except the SET_ROWS is consumed inside the group
+static bool ggml_metal_fusion_check_store_tail(const ggml_tensor * val, const ggml_tensor * sr, const ggml_cgraph * gf,
+        int r0, int r1) {
+    const ggml_tensor * vw = gf->nodes[r1 - 1];
+    if (sr != gf->nodes[r1] || vw->op != GGML_OP_VIEW || vw->view_src != val || vw->view_offs != 0 || sr->src[0] != vw) {
+        return false;
+    }
+    const ggml_tensor * idxs  = sr->src[1];
+    const ggml_tensor * cache = sr->src[2];
+    if (!idxs || !cache || (idxs->type != GGML_TYPE_I64 && idxs->type != GGML_TYPE_I32) || cache->type != GGML_TYPE_F16 ||
+        vw->ne[0] != val->ne[0]*val->ne[1] || vw->ne[1] != val->ne[2] || vw->nb[1] != val->nb[2] ||
+        cache->ne[0] != vw->ne[0] || cache->nb[0] != sizeof(ggml_fp16_t) || idxs->ne[0] != vw->ne[1] ||
+        sr->ne[2] != 1 || sr->ne[3] != 1 || idxs->ne[1] != 1 || !ggml_is_contiguous(val)) {
+        return false;
+    }
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+    return ggml_node_get_use_count(gf, r1) == 0;
+}
+
+// raw: SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL VIEW SET_ROWS (the K clip of inkling2, then the K cache store)
+static bool ggml_metal_fusion_check_clip_store(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 8];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * sq = nodes[0], * sr = nodes[1], * rt = nodes[2], * sc = nodes[3], * fill = nodes[4];
+    const ggml_tensor * div = nodes[5], * clamp = nodes[6], * out = nodes[7];
+    const ggml_tensor * x = sq->src[0];
+    if (!x || sr->src[0] != sq || rt->src[0] != sr || sc->src[0] != rt || fill->src[0] != sc || div->src[0] != fill ||
+        div->src[1] != sc || clamp->src[0] != div || out->src[0] != x || out->src[1] != clamp) {
+        return false;
+    }
+    const ggml_tensor * f32s[] = { x, sq, sr, rt, sc, fill, div, clamp, out };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (x->ne[0] % 4 != 0 || x->ne[0] > 128 || x->ne[3] != 1 || !ggml_are_same_shape(x, out) || !ggml_is_contiguous_rows(x) ||
+        sr->ne[0] != 1 || sr->ne[1] != x->ne[1] || sr->ne[2] != x->ne[2]) {
+        return false;
+    }
+    return ggml_metal_fusion_check_store_tail(out, nodes[8], gf, r0, r1);
+}
+
+// raw: RMS_NORM VIEW SET_ROWS (the V norm of inkling2, then the V cache store)
+static bool ggml_metal_fusion_check_norm_store(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 1];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * nrm = nodes[0];
+    const ggml_tensor * x   = nrm->src[0];
+    if (!x || x->type != GGML_TYPE_F32 || nrm->type != GGML_TYPE_F32 || nrm->src[1] != nullptr ||
+        x->ne[0] != 128 || x->ne[3] != 1 || !ggml_is_contiguous_rows(x) || !ggml_are_same_shape(x, nrm)) {
+        return false;
+    }
+    return ggml_metal_fusion_check_store_tail(nrm, nodes[1], gf, r0, r1);
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1517,6 +1618,9 @@ static const std::vector<ggml_op> ops_sconv_dyn = { GGML_OP_CONCAT, GGML_OP_VIEW
     GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
     GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
     GGML_OP_ADD, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_clip_store = { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL,
+                                                     GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+static const std::vector<ggml_op> ops_norm_store = { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                 GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
@@ -1571,6 +1675,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_CLIP_STORE, ops_clip_store, {}, true, ggml_metal_fusion_check_clip_store },
+    { GGML_METAL_FUSION_NORM_STORE, ops_norm_store, {}, true, ggml_metal_fusion_check_norm_store },
     { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
