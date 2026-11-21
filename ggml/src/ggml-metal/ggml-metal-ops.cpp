@@ -5670,6 +5670,15 @@ int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out),  5);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(resid ? resid : cur), 6);
 
+    if (args.T > 1) {
+        // prompt batch: one thread per output (the rolling kernel would leave most of the GPU idle)
+        ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_by_name(lib, "kernel_sconv_par_f32"));
+        const int64_t total = (int64_t) args.C*args.T*args.S;
+        const int nth = 256;
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((total + nth - 1)/nth), 1, 1, nth, 1, 1);
+        return n;
+    }
+
     const int total = args.C*args.S;
     const int nth   = 256;
     ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);

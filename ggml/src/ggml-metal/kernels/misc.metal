@@ -541,6 +541,58 @@ kernel void kernel_clip_rows_f32(
     }
 }
 
+// prompt batches: one thread per (channel, token, sequence), same arithmetic as kernel_sconv_f32; the thread of the
+// last token writes the state. Inputs and outputs must not alias (the check rejects it for T > 1).
+kernel void kernel_sconv_par_f32(
+        constant ggml_metal_kargs_sconv & args,
+        device const char * past,
+        device const char * cur,
+        device const char * w,
+        device       char * state,
+        device       char * dst,
+        device const char * resid,
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    const int64_t i = (int64_t) tgpig*ntg + tpitg;
+    if (i >= (int64_t) args.C*args.T*args.S) {
+        return;
+    }
+    const int c    = i % args.C;
+    const int64_t rest = i / args.C;
+    const int t    = rest % args.T;
+    const int s    = rest / args.T;
+
+    device const float * p = (device const float *) (past + c*args.nbp1 + s*args.nbp2);
+    float v[4];
+    for (int k = 0; k < 4; ++k) {
+        const int j = t + k; // window position in [past | cur]
+        v[k] = j < 3 ? p[j] : ((device const float *) (cur + ((int64_t) s*args.T + j - 3)*args.nbx1))[c];
+    }
+    const float4 wc = *((device const float4 *) (w + c*args.nbw1));
+
+    float conv = 0.0f;
+    conv += dot(float4(v[0], v[1], v[2], v[3]), wc);
+
+    const int64_t tok = (int64_t) s*args.T + t;
+    const float r = v[3] + conv;
+    const float y = args.sc * r + args.bi;
+    if (args.has_res) {
+        const float rv = ((device const float *) (resid + tok*args.nbr1))[c];
+        ((device float *) (dst + tok*args.nbd1))[c] = rv + y;
+    } else {
+        ((device float *) (dst + tok*args.nbd1))[c] = y;
+    }
+
+    if (t == args.T - 1) {
+        device float * st = (device float *) (state + s*args.nbs1) + 3*c;
+        for (int k = 0; k < 3; ++k) {
+            const int j = args.T + k;
+            st[k] = j < 3 ? p[j] : ((device const float *) (cur + ((int64_t) s*args.T + j - 3)*args.nbx1))[c];
+        }
+    }
+}
+
 // one thread per (channel, sequence): roll the 4-wide window over the tokens, like kernel_ssm_conv_f32_f32_4
 // (dot of the window with the weights), then add the input and scale; the last 3 inputs become the new state
 // f16 per-head mask: out[kv, t, h, s] = f16((sum_i bias[i, rp] * R[i, h, tok] - sinks[h, tok]) + mask[kv, t, 0, s])

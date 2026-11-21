@@ -592,7 +592,7 @@ static bool ggml_metal_fusion_check_sconv(
         // out is written element for element in the layout of cur (and of resid): only an exact in-place alias is safe
         if (overlap(out, root(past)) || overlap(out, root(w)) || overlap(out, root(cell)) ||
             overlap(cell, root(past)) || overlap(cell, root(cur)) ||
-            (overlap(out, root(cur)) && out->data != cur->data) ||
+            (overlap(out, root(cur)) && (out->data != cur->data || T > 1)) ||
             (resid && overlap(cell, root(resid))) ||
             (resid && overlap(out, root(resid)) && out->data != resid->data)) {
             return false;
