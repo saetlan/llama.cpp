@@ -720,22 +720,24 @@ static bool ggml_metal_fusion_check_mix_tail(
     const ggml_tensor * sm   = nodes[2];
     const ggml_tensor * mm2  = nodes[3];
 
-    const int r0 = node_idxs[idx] - 1; // the TRANSPOSE view
+    // the leading TRANSPOSE is a view: the optimizer packs it alone and may move it, so the raw range checked here
+    // starts at the CONT (ops_all[1..]) and the transpose is found through the CONT
+    const int r0 = node_idxs[idx];
     const int r1 = node_idxs[idx + 3];
-    if (r0 < 0 || r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+    if (r1 - r0 + 2 != (int) fusion->ops_all.size()) {
         return false;
     }
-    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+    for (int r = r0, j = 1; r <= r1; ++r, ++j) {
         if (gf->nodes[r]->op != fusion->ops_all[j]) {
             return false;
         }
     }
-    const ggml_tensor * tr     = gf->nodes[r0];
-    const ggml_tensor * qv     = gf->nodes[r0 + 2];
+    const ggml_tensor * tr     = cont->src[0];
+    const ggml_tensor * qv     = gf->nodes[r0 + 1];
     const ggml_tensor * states = mm1->src[0];
 
-    if (cont->src[0] != tr || tr->src[0] != states || mm1->src[1] != qv || sm->src[0] != mm1 || sm->src[1] != nullptr ||
-        mm2->src[0] != cont || mm2->src[1] != sm || qv->view_src == nullptr) {
+    if (tr == nullptr || tr->op != GGML_OP_TRANSPOSE || tr->src[0] != states || mm1->src[1] != qv || sm->src[0] != mm1 ||
+        sm->src[1] != nullptr || mm2->src[0] != cont || mm2->src[1] != sm || qv->view_src == nullptr) {
         return false;
     }
     float max_bias;
@@ -1650,6 +1652,11 @@ static void ggml_metal_fusion_add_pattern_alloc_deps(
             }
         }
         seen.insert(node);
+    }
+
+    // the mix tail kernel reads the scores product (an inner node) while writing the output: keep it alive too
+    if (fusion->id == GGML_METAL_FUSION_MIX_TAIL) {
+        add_alloc_dep(user_data, gf->nodes[node_idx + 3], gf->nodes[last_node]);
     }
 }
 
