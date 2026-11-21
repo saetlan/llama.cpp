@@ -471,14 +471,6 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             case GGML_OP_CPY:
             case GGML_OP_CONT:
             case GGML_OP_REPEAT:
-            // plain src -> dst ops; several Inkling fusions start with them (CONCAT, SQR), and the mix/control
-            // inputs are CONCATs: stopping the lookahead there left many independent kernels serialised
-            case GGML_OP_CONCAT:
-            case GGML_OP_SQR:
-            case GGML_OP_SQRT:
-            case GGML_OP_FILL:
-            case GGML_OP_PAD:
-            case GGML_OP_SOFT_MAX:
                 return true;
             default:
                 return ggml_op_is_empty(op);
