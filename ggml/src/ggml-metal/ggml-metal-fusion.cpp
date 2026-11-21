@@ -811,6 +811,145 @@ static bool ggml_metal_fusion_check_gate_mul(
         ggml_is_contiguous(mul) && ggml_nelements(mul) % 4 == 0;
 }
 
+// inkling2 convolve() with dynamic taps (n_conv = 4): x = concat(past, cur^T); state <- x[last 3];
+// out = ssm_conv(x, w); for lag: out += x_window(lag) * tap(lag, head); res = (cur + out)*scale. Validated here.
+static bool ggml_metal_fusion_check_sconv_dyn(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n = (int) fusion->ops.size();   // 17
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + n - 1];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * cat  = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+    const ggml_tensor * conv = nodes[2];
+    const ggml_tensor * addc = nodes[n - 2];
+    const ggml_tensor * scl  = nodes[n - 1];
+    const ggml_tensor * last = gf->nodes[r0 + 1];
+    const ggml_tensor * cell = gf->nodes[r0 + 2];
+    const ggml_tensor * outv = gf->nodes[r0 + 5];
+
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * xt   = cat->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * cur  = addc->src[0];
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || last->view_src != cat || cpy->src[0] != last || cpy->src[1] != cell ||
+        conv->src[0] != cat || outv->src[0] != conv || scl->src[0] != addc) {
+        return false;
+    }
+    const int64_t C = cat->ne[1], S = cat->ne[2], T = xt->ne[0];
+    if (T != 1 || S != 1) {
+        return false; // decode only
+    }
+
+    // the tap chain: per lag, a CONT of a transposed window view of x, a MUL by a tap view of the projection, an ADD
+    const ggml_tensor * acc = outv;
+    const ggml_tensor * dyn = nullptr;
+    for (int lag = 0; lag < 4; ++lag) {
+        const ggml_tensor * ct  = nodes[3 + 3*lag];
+        const ggml_tensor * mul = nodes[4 + 3*lag];
+        const ggml_tensor * ad  = nodes[5 + 3*lag];
+        const ggml_tensor * tr  = ct->src[0];
+        const ggml_tensor * win = tr ? tr->src[0] : nullptr;
+        if (!tr || tr->op != GGML_OP_TRANSPOSE || !win || win->op != GGML_OP_VIEW || win->view_src != cat ||
+            win->view_offs != (size_t) (3 - lag)*sizeof(float)) {
+            return false;
+        }
+        const ggml_tensor * mw = mul->src[0]; // reshape of the window copy
+        const ggml_tensor * tp = mul->src[1]; // tap view
+        if (!mw || mw->op != GGML_OP_RESHAPE || mw->src[0] != ct || !tp || tp->op != GGML_OP_VIEW) {
+            return false;
+        }
+        const ggml_tensor * d3 = tp->src[0];  // reshape_3d of the projection
+        if (!d3 || d3->op != GGML_OP_RESHAPE || d3->ne[0] != 4 || tp->view_offs != (size_t) lag*sizeof(float)) {
+            return false;
+        }
+        if (dyn == nullptr) {
+            dyn = d3;
+        } else if (d3 != dyn) {
+            return false;
+        }
+        const ggml_tensor * term = ad->src[1];
+        if (ad->src[0] != acc || !term || term->op != GGML_OP_RESHAPE || term->src[0] != mul) {
+            return false;
+        }
+        acc = ad;
+    }
+    if (addc->src[1] != acc) {
+        return false;
+    }
+    const int64_t H = dyn->ne[1];
+    if (H < 1 || C % H != 0) {
+        return false;
+    }
+
+    const ggml_tensor * f32s[] = { cat, past, xt, w, cur, conv, addc, scl, cell, dyn };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (past->ne[0] != 3 || past->ne[1] != C || cat->ne[0] != 3 + T || w->ne[0] != 4 || w->ne[1] != C ||
+        !ggml_is_contiguous(w) || !ggml_is_contiguous(cat) || last->view_offs != (size_t) T*sizeof(float) ||
+        cell->ne[0] != 3*C || cell->nb[0] != sizeof(float) || cur->ne[0] != C || cur->ne[1] != T*S ||
+        !ggml_is_contiguous(cur) || !ggml_is_contiguous(scl) || past->nb[0] != sizeof(float) ||
+        dyn->ne[2] != T*S || dyn->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL && xt->data != cur->data) {
+        return false;
+    }
+
+    for (int r = r0; r <= r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node == scl || node == cpy) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(scl, root(past)) || overlap(scl, root(w)) || overlap(scl, root(cell)) || overlap(scl, root(dyn)) ||
+            overlap(cell, root(past)) || overlap(cell, root(cur)) || overlap(cell, root(dyn)) ||
+            (overlap(scl, root(cur)) && scl->data != cur->data)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1368,6 +1507,14 @@ static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAP
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+// raw: CONCAT VIEW VIEW CPY SSM_CONV RESHAPE, lag 0 (window VIEW TRANSPOSE CONT RESHAPE, RESHAPE of the projection, tap VIEW,
+// MUL RESHAPE ADD), lags 1-3 (the projection reshape is visited already), ADD SCALE
+static const std::vector<ggml_op> ops_sconv_dyn = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_ADD, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                 GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
@@ -1422,6 +1569,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
     { GGML_METAL_FUSION_RELPOS, ops_relpos, {}, true, ggml_metal_fusion_check_relpos },
@@ -1874,9 +2022,9 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
             break;
         }
-        // the packed span is capped at GGML_METAL_FUSION_MAX raw nodes (views included): do not chain a pattern that
-        // would be cut by the cap, or its tail is packed apart and the reorder can split the pattern
-        if (i_f > 0 && idxs[i_f + len - 1] - idx + 1 > GGML_METAL_FUSION_MAX) {
+        // a single pattern may span up to GGML_METAL_FUSION_MAX raw nodes; chaining more patterns behind it stops at
+        // GGML_METAL_FUSION_CHAIN_MAX, and never cuts a pattern (a cut tail is packed apart and can be reordered)
+        if (i_f > 0 && idxs[i_f + len - 1] - idx + 1 > GGML_METAL_FUSION_CHAIN_MAX) {
             break;
         }
 

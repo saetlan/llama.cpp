@@ -593,6 +593,51 @@ kernel void kernel_sconv_par_f32(
     }
 }
 
+// one token, dynamic taps: out = (cur + (conv + sum_lag x[3-lag]*tap[lag, head]))*sc, in the unfused rounding order
+kernel void kernel_sconv_dyn_f32(
+        constant ggml_metal_kargs_sconv_dyn & args,
+        device const char * past,
+        device const char * cur,
+        device const char * w,
+        device       char * state,
+        device       char * dst,
+        device const char * dyn,
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    const int c = tgpig*ntg + tpitg;
+    if (c >= args.C) {
+        return;
+    }
+    device const float * p = (device const float *) (past + c*args.nbp1);
+    const float v0 = p[0];
+    const float v1 = p[1];
+    const float v2 = p[2];
+    const float v3 = ((device const float *) cur)[c];
+    const float4 wc = *((device const float4 *) (w + c*args.nbw1));
+
+    float o = 0.0f;
+    o += dot(float4(v0, v1, v2, v3), wc);
+
+    device const float * tap = (device const float *) (dyn + (c/args.cph)*args.nbd1);
+    const float v[4] = { v0, v1, v2, v3 };
+    {
+        // the unfused graph rounds each tap product (MUL) before adding it (ADD): no fused multiply-add here
+#pragma clang fp contract(off)
+        for (int lag = 0; lag < 4; ++lag) {
+            const float term = v[3 - lag] * tap[lag];
+            o = o + term;
+        }
+        const float r = v3 + o;
+        ((device float *) dst)[c] = args.sc * r + args.bi;
+    }
+
+    device float * st = (device float *) state + 3*c;
+    st[0] = v1;
+    st[1] = v2;
+    st[2] = v3;
+}
+
 // one thread per (channel, sequence): roll the 4-wide window over the tokens, like kernel_ssm_conv_f32_f32_4
 // (dot of the window with the weights), then add the input and scale; the last 3 inputs become the new state
 // f16 per-head mask: out[kv, t, h, s] = f16((sum_i bias[i, rp] * R[i, h, tok] - sinks[h, tok]) + mask[kv, t, 0, s])

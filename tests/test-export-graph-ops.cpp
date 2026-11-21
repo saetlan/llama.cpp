@@ -89,7 +89,9 @@ struct test_object {
 };
 
 static std::map<test_object, int> g_counts_tg; // hill-climb: per-token op counts
+static std::map<test_object, int> g_counts_pp; // hill-climb: per-ubatch op counts
 static bool g_count = false;
+static bool g_count_pp = false;
 static void extract_graph_ops(ggml_cgraph * cgraph, const char * label, std::set<test_object> & tests) {
     int n_nodes = ggml_graph_n_nodes(cgraph);
     int n_skipped = 0;
@@ -121,6 +123,7 @@ static void extract_graph_ops(ggml_cgraph * cgraph, const char * label, std::set
 
         test.name = node->name;
         if (g_count) { g_counts_tg[test]++; }
+        if (g_count_pp) { g_counts_pp[test]++; }
         tests.insert(test);
     }
 
@@ -208,7 +211,13 @@ int main(int argc, char ** argv) {
         LOG_ERR("failed to reserve prompt processing graph\n");
         return 1;
     }
+    g_count_pp = true;
     extract_graph_ops(gf_pp, "pp", tests);
+    g_count_pp = false;
+    {
+        std::ofstream fc(params.out_file + ".ppcounts");
+        for (const auto & kv : g_counts_pp) { fc << kv.second << ' '; kv.first.serialize(fc); }
+    }
 
     auto * gf_tg = llama_graph_reserve(ctx, n_seqs, n_seqs, n_seqs);
     if (!gf_tg) {

@@ -765,6 +765,16 @@ typedef struct {
 } ggml_metal_kargs_sconv;
 
 typedef struct {
+    int32_t  C;
+    int32_t  cph;   // channels per head
+    uint64_t nbp1;  // past channel stride
+    uint64_t nbw1;  // weight row
+    uint64_t nbd1;  // projection: head stride (lag stride is 4 bytes)
+    float    sc;
+    float    bi;
+} ggml_metal_kargs_sconv_dyn;
+
+typedef struct {
     int32_t  NR;    // relative features
     int32_t  H;
     int32_t  NK;    // kv cells

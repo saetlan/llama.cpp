@@ -569,6 +569,10 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_sconv_fused(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SCONV_DYN) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_sconv_dyn_fused(ctx, idx, n);
+        }
     }
 
     ggml_tensor * op = ctx->node(idx);
@@ -5557,6 +5561,55 @@ int ggml_metal_op_gate_mul_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, (args.n4 + nth - 1)/nth, 1, 1, nth, 1, 1);
 
     return 2;
+}
+
+// dynamic-tap short conv at one token; idx is the CONCAT, n the group size (17)
+int ggml_metal_op_sconv_dyn_fused(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * cat  = ctx->node(idx + 0);
+    const ggml_tensor * cpy  = ctx->node(idx + 1);
+    const ggml_tensor * conv = ctx->node(idx + 2);
+    const ggml_tensor * mul0 = ctx->node(idx + 4);
+    const ggml_tensor * addc = ctx->node(idx + n - 2);
+    ggml_tensor       * scl  = ctx->node(idx + n - 1);
+
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * cur  = addc->src[0];
+    const ggml_tensor * cell = cpy->src[1];
+    const ggml_tensor * dyn  = mul0->src[1]->src[0]; // reshape_3d of the tap projection
+
+    for (int i = 1; i < n; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_sconv_dyn args = {};
+    args.C    = (int32_t) cat->ne[1];
+    args.cph  = (int32_t) (cat->ne[1]/dyn->ne[1]);
+    args.nbp1 = past->nb[1];
+    args.nbw1 = w->nb[1];
+    args.nbd1 = dyn->nb[1];
+    args.sc   = ggml_get_op_params_f32(scl, 0);
+    args.bi   = ggml_get_op_params_f32(scl, 1);
+
+    ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_by_name(lib, "kernel_sconv_dyn_f32"));
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(past), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),    3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scl),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dyn),  6);
+
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.C + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return n;
 }
 
 // Dispatch the fused rel-pos mask; idx points at the bias-table MUL_MAT and the caller has validated the group.

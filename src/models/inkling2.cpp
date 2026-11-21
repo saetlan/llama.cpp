@@ -251,6 +251,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    if (dynamic) {
+        // the tap projection first, so it does not land inside the convolution group (Metal fuses the group)
+        ggml_build_forward_expand(gf, dynamic);
+    }
+
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -280,10 +285,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     }
 
     ggml_tensor * res = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
-    if (!dynamic) {
-        // keep the chain together in the graph (Metal fuses it into one kernel)
-        ggml_build_forward_expand(gf, res);
-    }
+    // keep the chain together in the graph (Metal fuses it into one kernel)
+    ggml_build_forward_expand(gf, res);
     return res;
 }
 

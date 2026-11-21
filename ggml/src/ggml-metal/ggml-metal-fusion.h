@@ -20,7 +20,10 @@ struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 16
+#define GGML_METAL_FUSION_MAX 48
+
+// the optimizer chains back-to-back patterns into one packed group only up to this many nodes (raw span)
+#define GGML_METAL_FUSION_CHAIN_MAX 16
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
@@ -50,6 +53,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_RELPOS,       // MUL_MAT + SUB + CONT + GET_ROWS + CONT + ADD + CPY (inkling2 rel-pos F16 mask)
     GGML_METAL_FUSION_MIX_TAIL,     // CONT + MUL_MAT + SOFT_MAX + MUL_MAT: scores product, then softmax-weighted sum
     GGML_METAL_FUSION_GATE_MUL,     // UNARY(sigmoid) + MUL
+    GGML_METAL_FUSION_SCONV_DYN,    // short conv with 4 input-dependent taps per head (17 ops)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
