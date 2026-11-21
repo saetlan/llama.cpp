@@ -4706,6 +4706,40 @@ struct test_relpos_fuse : public test_case {
     }
 };
 
+struct test_mix_tail_fuse : public test_case {
+    const int64_t E, nr, nq;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MIX_TAIL_FUSE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-8; }
+    std::string vars() override { return VARS_TO_STR3(E, nr, nq); }
+    test_mix_tail_fuse(int64_t E = 2304, int64_t nr = 4, int64_t nq = 1) : E(E), nr(nr), nq(nq) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, nr, 1); ggml_set_name(x, "x");
+        ggml_tensor * states = ggml_rms_norm(ctx, x, 1e-6f);
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, nq); ggml_set_name(query, "query");
+        ggml_tensor * scores = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, states, ggml_reshape_3d(ctx, query, E, nq, 1)), nullptr, 1.0f/sqrtf((float) E), 0.0f);
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_gate_mul_fuse : public test_case {
+    const int64_t n, T;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GATE_MUL_FUSE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-9; }
+    std::string vars() override { return VARS_TO_STR2(n, T); }
+    test_gate_mul_fuse(int64_t n = 3072, int64_t T = 1) : n(n), T(T) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T); ggml_set_name(c, "c");
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T); ggml_set_name(g, "g");
+        ggml_tensor * out = ggml_mul(ctx, c, ggml_sigmoid(ctx, g));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_clip_rows_fuse : public test_case {
     const std::array<int64_t, 3> ne; // [n_embd_head, n_head, n_tokens]
     const bool scaled;
@@ -10899,7 +10933,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_situ_fuse({1152, 8, 7})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 512})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 333}));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 3}, true));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 8, 3}, false));
-        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_relpos_fuse(1280, 1)); test_cases.emplace_back(new test_relpos_fuse(4352, 1)); test_cases.emplace_back(new test_relpos_fuse(1536, 5)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
+        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_mix_tail_fuse(2304, 4, 1)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 6, 4)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 1, 3)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 1)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 5)); test_cases.emplace_back(new test_relpos_fuse(1280, 1)); test_cases.emplace_back(new test_relpos_fuse(4352, 1)); test_cases.emplace_back(new test_relpos_fuse(1536, 5)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two

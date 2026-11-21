@@ -230,14 +230,8 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    ggml_tensor * states_t = nullptr;
-    auto it = states_t_cache.find(states);
-    if (it != states_t_cache.end()) {
-        states_t = it->second;
-    } else {
-        states_t = ggml_cont(ctx0, ggml_transpose(ctx0, states));
-        states_t_cache[states] = states_t;
-    }
+    // one transposed copy per mix: on Metal the copy, the softmax and the second product become one kernel
+    ggml_tensor * states_t = ggml_cont(ctx0, ggml_transpose(ctx0, states));
 
     return ggml_mul_mat(ctx0, states_t, scores);
 }

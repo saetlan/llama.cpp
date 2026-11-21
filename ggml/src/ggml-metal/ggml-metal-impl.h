@@ -780,6 +780,19 @@ typedef struct {
 } ggml_metal_kargs_relpos;
 
 typedef struct {
+    int32_t  E;
+    int32_t  nr;
+    uint64_t nbs1;  // states row stride
+    uint64_t nbp1;  // scores: per query
+    uint64_t nbd1;  // out: per query
+    float    scale;
+} ggml_metal_kargs_mix_tail;
+
+typedef struct {
+    int32_t n4;     // float4 elements
+} ggml_metal_kargs_gate_mul;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

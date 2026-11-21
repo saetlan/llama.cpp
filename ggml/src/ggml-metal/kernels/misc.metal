@@ -583,6 +583,58 @@ kernel void kernel_relpos_mask_f32(
     dst[i] = (half) (v + m);
 }
 
+// softmax over the nr scores of query q, then out[e] = sum_r p_r * states[e, r]; one thread per channel
+kernel void kernel_mix_tail_f32(
+        constant ggml_metal_kargs_mix_tail & args,
+        device const char * states,
+        device const char * scores,
+        device       char * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg   [[threads_per_threadgroup]]) {
+    const int e = tgpig.x*ntg.x + tpitg.x;
+    const int q = tgpig.y;
+    if (e >= args.E) {
+        return;
+    }
+    device const float * sc = (device const float *) (scores + q*args.nbp1);
+    float p[8];
+    float mx = -INFINITY;
+    for (int r = 0; r < args.nr; ++r) {
+        p[r] = sc[r]*args.scale;
+        mx = max(mx, p[r]);
+    }
+    float sum = 0.0f;
+    for (int r = 0; r < args.nr; ++r) {
+        p[r] = exp(p[r] - mx);
+        sum += p[r];
+    }
+    const float inv = 1.0f/sum;
+    float o = 0.0f;
+    for (int r = 0; r < args.nr; ++r) {
+        o += ((device const float *) (states + r*args.nbs1))[e] * (p[r]*inv);
+    }
+    ((device float *) (dst + q*args.nbd1))[e] = o;
+}
+
+// out = c * sigmoid(g), float4 lanes like the unfused unary/bin kernels
+kernel void kernel_gate_mul_f32(
+        constant ggml_metal_kargs_gate_mul & args,
+        device const float4 * c,
+        device const float4 * g,
+        device       float4 * dst,
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    const int i = tgpig*ntg + tpitg;
+    if (i >= args.n4) {
+        return;
+    }
+    const float4 x = g[i];
+    const float4 s = 1 / (1 + exp(-x));
+    dst[i] = c[i] * s;
+}
+
 kernel void kernel_sconv_f32(
         constant ggml_metal_kargs_sconv & args,
         device const char * past,

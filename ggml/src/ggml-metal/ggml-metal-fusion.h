@@ -48,6 +48,8 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_CTRL_MIX,     // TANH + MUL + SUB + TANH + MUL + ADD: (c - tanh(f)*c) + tanh(g)*m
     GGML_METAL_FUSION_SCONV,        // CONCAT + CPY + SSM_CONV + ADD + SCALE (short conv, state store, residual)
     GGML_METAL_FUSION_RELPOS,       // MUL_MAT + SUB + CONT + GET_ROWS + CONT + ADD + CPY (inkling2 rel-pos F16 mask)
+    GGML_METAL_FUSION_MIX_TAIL,     // CONT + MUL_MAT + SOFT_MAX + MUL_MAT: scores product, then softmax-weighted sum
+    GGML_METAL_FUSION_GATE_MUL,     // UNARY(sigmoid) + MUL
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

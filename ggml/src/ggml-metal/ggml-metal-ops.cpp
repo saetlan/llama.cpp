@@ -860,6 +860,16 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // attention output gate c*sigmoid(g)
+    if (op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GATE_MUL) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_gate_mul_fused(ctx, idx);
+        }
+    }
+
     // the sigmoid and sqrt(softplus) TOPK_MOE fusions anchor at the gating unary node
     if (op->op == GGML_OP_UNARY && ctx->use_fusion() &&
         (ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS || ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID)) {
@@ -2388,6 +2398,15 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+    if (ctx->node(idx)->op == GGML_OP_CONT && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MIX_TAIL) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_mix_tail_fused(ctx, idx);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -5470,6 +5489,74 @@ int ggml_metal_op_clip_rows_fused(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[1], out->ne[2], 1, std::min(32, (int) args.nl), 1, 1);
 
     return n;
+}
+
+// mix tail: idx is the CONT; nodes CONT MUL_MAT SOFT_MAX MUL_MAT. Encode the scores product as usual, then one kernel.
+int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mm1 = ctx->node(idx + 1);
+    const ggml_tensor * sm  = ctx->node(idx + 2);
+    ggml_tensor       * mm2 = ctx->node(idx + 3);
+    const ggml_tensor * states = mm1->src[0];
+
+    // the scores product, with the usual dependency check
+    if (!ggml_metal_op_concurrency_check(ctx, mm1)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+    ggml_metal_op_mul_mat(ctx, idx + 1);
+    // the tail reads the scores
+    ggml_metal_op_concurrency_reset(ctx);
+
+    ggml_metal_kargs_mix_tail args = {};
+    args.E    = (int32_t) states->ne[0];
+    args.nr   = (int32_t) states->ne[1];
+    args.nbs1 = states->nb[1];
+    args.nbp1 = mm1->nb[1];
+    args.nbd1 = mm2->nb[1];
+    memcpy(&args.scale, (const float *) sm->op_params + 0, sizeof(float));
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mix_tail_f32");
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(states), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm1),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm2),    3);
+
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.E + nth - 1)/nth, mm2->ne[1], 1, nth, 1, 1);
+
+    return 4;
+}
+
+// gate: idx is the sigmoid; out = c*sigmoid(g)
+int ggml_metal_op_gate_mul_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * sg  = ctx->node(idx + 0);
+    ggml_tensor       * mul = ctx->node(idx + 1);
+
+    if (!ggml_metal_op_concurrency_check(ctx, mul)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
+    ggml_metal_kargs_gate_mul args = { /*.n4 =*/ (int32_t) (ggml_nelements(mul)/4) };
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_gate_mul_f32");
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sg->src[0]),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul),         3);
+
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n4 + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 2;
 }
 
 // Dispatch the fused rel-pos mask; idx points at the bias-table MUL_MAT and the caller has validated the group.

@@ -690,6 +690,111 @@ static bool ggml_metal_fusion_check_relpos(
     return true;
 }
 
+// inkling2 mix() at one token: raw TRANSPOSE CONT RESHAPE MUL_MAT SOFT_MAX MUL_MAT. The scores product runs as is;
+// the transposed copy, the softmax and the second product become one kernel that reads the states directly.
+static bool ggml_metal_fusion_check_mix_tail(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * cont = nodes[0];
+    const ggml_tensor * mm1  = nodes[1];
+    const ggml_tensor * sm   = nodes[2];
+    const ggml_tensor * mm2  = nodes[3];
+
+    const int r0 = node_idxs[idx] - 1; // the TRANSPOSE view
+    const int r1 = node_idxs[idx + 3];
+    if (r0 < 0 || r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * tr     = gf->nodes[r0];
+    const ggml_tensor * qv     = gf->nodes[r0 + 2];
+    const ggml_tensor * states = mm1->src[0];
+
+    if (cont->src[0] != tr || tr->src[0] != states || mm1->src[1] != qv || sm->src[0] != mm1 || sm->src[1] != nullptr ||
+        mm2->src[0] != cont || mm2->src[1] != sm || qv->view_src == nullptr) {
+        return false;
+    }
+    float max_bias;
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+
+    const ggml_tensor * f32s[] = { states, qv, cont, mm1, sm, mm2 };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t E = states->ne[0], nr = states->ne[1], T = states->ne[2];
+    if (max_bias != 0.0f || T != 1 || nr < 1 || nr > 8 || states->ne[3] != 1 || !ggml_is_contiguous_rows(states) ||
+        mm1->ne[0] != nr || mm2->ne[0] != E || mm2->ne[2] != T || !ggml_is_contiguous(mm2) || !ggml_is_contiguous(mm1) ||
+        sm->ne[0] != nr || !ggml_is_contiguous(sm)) {
+        return false;
+    }
+
+    // the copy, the softmax and the scores are consumed only inside the group (the scores by the softmax)
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // the kernel reads the states and the scores (mm1) while writing mm2
+        if (overlap(mm2, root(states)) || overlap(mm2, mm1)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// out = c * sigmoid(g), as UNARY(sigmoid) MUL (inkling2 attention output gate)
+static bool ggml_metal_fusion_check_gate_mul(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion); GGML_UNUSED(gf); GGML_UNUSED(node_idxs); GGML_UNUSED(idx); GGML_UNUSED(mode);
+    const ggml_tensor * sg  = nodes[0];
+    const ggml_tensor * mul = nodes[1];
+    if (ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID || mul->src[1] != sg) {
+        return false;
+    }
+    const ggml_tensor * c = mul->src[0];
+    const ggml_tensor * g = sg->src[0];
+    return c->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && sg->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(c, mul) && ggml_are_same_shape(g, mul) && ggml_is_contiguous(c) && ggml_is_contiguous(g) &&
+        ggml_is_contiguous(mul) && ggml_nelements(mul) % 4 == 0;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1243,6 +1348,8 @@ static const std::vector<ggml_op> ops_sconv = { GGML_OP_CONCAT, GGML_OP_VIEW, GG
                                                 GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT,
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
+static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                 GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
@@ -1297,6 +1404,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
+    { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
     { GGML_METAL_FUSION_RELPOS, ops_relpos, {}, true, ggml_metal_fusion_check_relpos },
     { GGML_METAL_FUSION_SCONV, ops_sconv, {}, true,  ggml_metal_fusion_check_sconv },
     { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix,     {}, true, ggml_metal_fusion_check_ctrl_mix },
