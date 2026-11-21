@@ -2517,7 +2517,7 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, ggml_tensor * message_normed, const loop_layer & loop, int ctrl);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2537,6 +2537,17 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // hill-climb: share work that repeats across layers and loop passes (values are unchanged)
+        ggml_tensor * norm_once(ggml_tensor * x);                                // rms_norm(x, 1e-6), once per tensor
+        ggml_tensor * block_stack(const std::vector<ggml_tensor *> & blocks);    // normed blocks, newest first
+        ggml_tensor * mix_states(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur);
+        std::map<ggml_tensor *, ggml_tensor *> norm_cache;
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> stack_cache;
+        std::map<std::pair<std::vector<ggml_tensor *>, ggml_tensor *>, ggml_tensor *> states_cache;
+        std::map<ggml_tensor *, ggml_tensor *> states_t_cache;
+        std::map<const ggml_tensor *, ggml_tensor *> pad_cache;
+        ggml_tensor * zero_sinks = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

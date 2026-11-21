@@ -12,6 +12,7 @@
 #include <array>
 #include <vector>
 #include <set>
+#include <map>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -87,6 +88,8 @@ struct test_object {
     }
 };
 
+static std::map<test_object, int> g_counts_tg; // hill-climb: per-token op counts
+static bool g_count = false;
 static void extract_graph_ops(ggml_cgraph * cgraph, const char * label, std::set<test_object> & tests) {
     int n_nodes = ggml_graph_n_nodes(cgraph);
     int n_skipped = 0;
@@ -117,6 +120,7 @@ static void extract_graph_ops(ggml_cgraph * cgraph, const char * label, std::set
         }
 
         test.name = node->name;
+        if (g_count) { g_counts_tg[test]++; }
         tests.insert(test);
     }
 
@@ -211,7 +215,13 @@ int main(int argc, char ** argv) {
         LOG_ERR("failed to reserve token generation graph\n");
         return 1;
     }
+    g_count = true;
     extract_graph_ops(gf_tg, "tg", tests);
+    g_count = false;
+    {
+        std::ofstream fc(params.out_file + ".tgcounts");
+        for (const auto & kv : g_counts_tg) { fc << kv.second << ' '; kv.first.serialize(fc); }
+    }
 
     LOG_INF("%d unique ops total\n", (int) tests.size());
 
