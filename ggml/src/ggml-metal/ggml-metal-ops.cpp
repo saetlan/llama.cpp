@@ -821,6 +821,26 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
+    // row L2 clip (no scale) anchors at its SQR
+    if (op->op == GGML_OP_SQR && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_ROWS) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_clip_rows_fused(ctx, idx, n);
+        }
+    }
+
+    // situ GLU anchors at its leading SCALE
+    if (op->op == GGML_OP_SCALE && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SITU) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_situ_fused(ctx, idx);
+        }
+    }
+
     // the sigmoid and sqrt(softplus) TOPK_MOE fusions anchor at the gating unary node
     if (op->op == GGML_OP_UNARY && ctx->use_fusion() &&
         (ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS || ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID)) {
@@ -4359,6 +4379,12 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         n_fuse = n;
 
+        // row L2 clip with a per-channel scale
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CLIP_ROWS) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_clip_rows_fused(ctx, idx, n_fuse);
+        }
+
         // snake activation autofuse: mul -> sin -> sqr -> mul -> add
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SNAKE) {
             ctx->count_fusions(fusion);
@@ -5364,6 +5390,109 @@ int ggml_metal_op_col2im_1d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
 
     return 1;
+}
+
+// Dispatch the fused row-clip kernel; n is 8 (no scale) or 9 (leading MUL by a per-channel scale).
+int ggml_metal_op_clip_rows_fused(ggml_metal_op_t ctx, int idx, int n) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const bool scaled = n == 9;
+    const int  o      = scaled ? 1 : 0;
+
+    const ggml_tensor * first = ctx->node(idx);
+    const ggml_tensor * sc    = ctx->node(idx + o + 3);
+    const ggml_tensor * fill  = ctx->node(idx + o + 4);
+    const ggml_tensor * clmp  = ctx->node(idx + o + 6);
+    ggml_tensor       * out   = ctx->node(idx + o + 7);
+
+    const ggml_tensor * cur   = first->src[0];
+    const ggml_tensor * scale = scaled ? first->src[1] : nullptr;
+
+    for (int i = 1; i < n; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_clip_rows args = {};
+    args.nl        = (int32_t) (cur->ne[0]/4);
+    args.has_scale = scaled ? 1 : 0;
+    args.nb1       = cur->nb[1];
+    args.nb2       = cur->nb[2];
+    args.nbs1      = scaled ? scale->nb[1] : 0;
+    args.nbd1      = out->nb[1];
+    args.nbd2      = out->nb[2];
+    args.sc        = ggml_get_op_params_f32(sc, 0);
+    args.bi        = ggml_get_op_params_f32(sc, 1);
+    args.thr       = ggml_get_op_params_f32(fill, 0);
+    args.lo        = ggml_get_op_params_f32(clmp, 0);
+    args.hi        = ggml_get_op_params_f32(clmp, 1);
+
+    auto pipeline = ggml_metal_library_get_pipeline_clip_rows(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scaled ? scale : cur), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out), 3);
+
+    // one SIMD group per row, nl lanes active (kernel_sum_rows uses min(32, nl) threads)
+    ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[1], out->ne[2], 1, std::min(32, (int) args.nl), 1, 1);
+
+    return n;
+}
+
+// Dispatch the fused situ kernel; idx points at the leading SCALE and the caller has validated the group.
+int ggml_metal_op_situ_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * s1  = ctx->node(idx + 0);
+    const ggml_tensor * s2  = ctx->node(idx + 2);
+    const ggml_tensor * s3  = ctx->node(idx + 5);
+    const ggml_tensor * s4  = ctx->node(idx + 7);
+    ggml_tensor       * out = ctx->node(idx + 8);
+
+    const ggml_tensor * g = s1->src[0];
+    const ggml_tensor * u = s3->src[0];
+
+    // the encode loop pre-checked the leading node only, check the rest of the group
+    for (int i = 1; i < 9; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_situ args = {};
+    args.ne0  = (int32_t) out->ne[0];
+    args.ne1  = (int32_t) out->ne[1];
+    args.ne2  = (int32_t) out->ne[2];
+    args.nbg1 = g->nb[1];
+    args.nbg2 = g->nb[2];
+    args.nbu1 = u->nb[1];
+    args.nbu2 = u->nb[2];
+    const ggml_tensor * scales[4] = { s1, s2, s3, s4 };
+    for (int k = 0; k < 4; ++k) {
+        memcpy(&args.sc[k], (const float *) scales[k]->op_params + 0, sizeof(float));
+        memcpy(&args.bi[k], (const float *) scales[k]->op_params + 1, sizeof(float));
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_situ(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(u),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out), 3);
+
+    const int total = (args.ne0/4)*args.ne1*args.ne2;
+    const int nth   = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 9;
 }
 
 // Dispatch the fused snake kernel from the matched mul -> sin -> sqr -> mul -> add chain.

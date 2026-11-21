@@ -286,6 +286,147 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+// situ(gate, up) = (b*tanh(gate/b) + 0)*sigmoid(gate) * (lb*tanh(up/lb) + 0), as built by build_moe_ffn (LLM_FFN_SITU):
+// SCALE(g) TANH SCALE SIGMOID(g) MUL SCALE(u) TANH SCALE MUL. Two branches, so the generic chain check does not apply
+// (unsafe = true) and the whole validation lives here.
+static bool ggml_metal_fusion_check_situ(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * s1  = nodes[0];
+    const ggml_tensor * t1  = nodes[1];
+    const ggml_tensor * s2  = nodes[2];
+    const ggml_tensor * sg  = nodes[3];
+    const ggml_tensor * act = nodes[4];
+    const ggml_tensor * s3  = nodes[5];
+    const ggml_tensor * t2  = nodes[6];
+    const ggml_tensor * s4  = nodes[7];
+    const ggml_tensor * out = nodes[8];
+
+    if (ggml_get_unary_op(t1) != GGML_UNARY_OP_TANH || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(t2) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+
+    const ggml_tensor * g = s1->src[0];
+    const ggml_tensor * u = s3->src[0];
+
+    const bool wired =
+        t1->src[0] == s1 && s2->src[0] == t1 && sg->src[0] == g &&
+        ((act->src[0] == s2 && act->src[1] == sg) || (act->src[0] == sg && act->src[1] == s2)) &&
+        t2->src[0] == s3 && s4->src[0] == t2 &&
+        ((out->src[0] == act && out->src[1] == s4) || (out->src[0] == s4 && out->src[1] == act));
+    if (!wired || g == nullptr || u == nullptr) {
+        return false;
+    }
+
+    // everything F32 and element-wise over one [ne0, ne1, ne2] shape; the kernel walks g and u by row strides
+    const ggml_tensor * all[] = { g, u, s1, t1, s2, sg, act, s3, t2, s4, out };
+    for (const ggml_tensor * t : all) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, out)) {
+            return false;
+        }
+    }
+    if (out->ne[3] != 1 || out->ne[0] % 4 != 0 || !ggml_is_contiguous_rows(g) || !ggml_is_contiguous_rows(u) ||
+        !ggml_is_contiguous(out) || g->nb[1] % 16 != 0 || g->nb[2] % 16 != 0 || u->nb[1] % 16 != 0 ||
+        u->nb[2] % 16 != 0 || (u->view_offs % 16) != 0 || (g->view_offs % 16) != 0) {
+        return false;
+    }
+
+    // out is written in its own layout while g and u are read in theirs (row stride 2*ne0): any overlap with the
+    // tensor they view is a race, including the in-place case that the generic range check treats as safe
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(out, root(g)) || overlap(out, root(u))) {
+            return false;
+        }
+    }
+
+    // only out leaves the group
+    int outputs[1] = { node_idxs[idx + 8] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 9, fusion->ops.data(), outputs, 1);
+}
+
+// row L2-norm clip, as built by inkling2 clip(): y = x*clamp(thr/(sqrt(sum(x*x)) + eps), lo, hi), with an optional
+// per-channel scale x = cur*scale in front. Validated here (unsafe = true): x feeds both SQR and the last MUL.
+static bool ggml_metal_fusion_check_clip_rows(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int  n     = (int) fusion->ops.size();
+    const bool scaled = n == 9;
+    const int  o     = scaled ? 1 : 0;
+
+    const ggml_tensor * mul0  = scaled ? nodes[0] : nullptr;
+    const ggml_tensor * sq    = nodes[o + 0];
+    const ggml_tensor * sr    = nodes[o + 1];
+    const ggml_tensor * rt    = nodes[o + 2];
+    const ggml_tensor * sc    = nodes[o + 3];
+    const ggml_tensor * fill  = nodes[o + 4];
+    const ggml_tensor * div   = nodes[o + 5];
+    const ggml_tensor * clamp = nodes[o + 6];
+    const ggml_tensor * out   = nodes[o + 7];
+
+    const ggml_tensor * x = scaled ? mul0 : sq->src[0];
+    if (x == nullptr) {
+        return false;
+    }
+
+    const bool wired =
+        sq->src[0] == x && sr->src[0] == sq && rt->src[0] == sr && sc->src[0] == rt && fill->src[0] == sc &&
+        div->src[0] == fill && div->src[1] == sc && clamp->src[0] == div &&
+        out->src[0] == x && out->src[1] == clamp;
+    if (!wired) {
+        return false;
+    }
+
+    const ggml_tensor * cur   = scaled ? mul0->src[0] : x;
+    const ggml_tensor * scale = scaled ? mul0->src[1] : nullptr;
+
+    // F32 rows of a multiple of 4 floats, at most 32 float4 (one SIMD group per row, like kernel_sum_rows_f32_f32_4)
+    const ggml_tensor * f32s[] = { cur, x, sq, sr, rt, sc, fill, div, clamp, out };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (x->ne[0] % 4 != 0 || x->ne[0] > 128 || x->ne[3] != 1 || !ggml_are_same_shape(x, out) ||
+        !ggml_are_same_shape(cur, x) || !ggml_are_same_shape(x, sq) ||
+        sr->ne[0] != 1 || sr->ne[1] != x->ne[1] || sr->ne[2] != x->ne[2] ||
+        !ggml_are_same_shape(sr, rt) || !ggml_are_same_shape(sr, sc) || !ggml_are_same_shape(sr, fill) ||
+        !ggml_are_same_shape(sr, div) || !ggml_are_same_shape(sr, clamp) ||
+        !ggml_is_contiguous_rows(cur) || !ggml_is_contiguous(out)) {
+        return false;
+    }
+    if (scaled) {
+        if (scale->type != GGML_TYPE_F32 || scale->ne[0] != x->ne[0] || scale->ne[1] != x->ne[1] ||
+            scale->ne[2] != 1 || scale->ne[3] != 1 || !ggml_is_contiguous(scale) || mul0->src[0] != cur) {
+            return false;
+        }
+    }
+
+    int outputs[1] = { node_idxs[idx + n - 1] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -827,6 +968,13 @@ static const std::vector<ggml_op> ops_add_5 = { GGML_OP_ADD, GGML_OP_ADD, GGML_O
 static const std::vector<ggml_op> ops_add_6 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_add_7 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_clip_rows        = { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                                                          GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_clip_rows_scaled = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                                                          GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+// raw order includes the VIEW of up (gate_up second half), which the graph visits right before its SCALE
+static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                                GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
@@ -878,6 +1026,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_ADD_CHAIN, ops_add_7, {}, false, ggml_metal_fusion_check_add_chain },
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
+    { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows,        {}, true, ggml_metal_fusion_check_clip_rows },
+    { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows_scaled, {}, true, ggml_metal_fusion_check_clip_rows },
 
     { GGML_METAL_FUSION_GDN_CACHE, ops_gdn_cache, {}, true, ggml_metal_fusion_check_gdn_cache },
 

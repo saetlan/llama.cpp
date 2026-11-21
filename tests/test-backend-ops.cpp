@@ -4615,6 +4615,59 @@ struct test_add_unary_mul : public test_case {
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
+// hill-climb: inkling2 situ GLU and row L2 clip, as built by the graph (exercises the Metal fusions)
+struct test_situ_fuse : public test_case {
+    const std::array<int64_t, 3> ne; // [n_ff, n_used, n_tokens]
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "SITU_FUSE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-9; }
+    std::string vars() override { return VARS_TO_STR1(ne); }
+    test_situ_fuse(std::array<int64_t, 3> ne = {1152, 8, 2}) : ne(ne) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2]);
+        ggml_set_name(gate_up, "gate_up");
+        ggml_tensor * cur = ggml_view_3d(ctx, gate_up, ne[0], ne[1], ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up  = ggml_view_3d(ctx, gate_up, ne[0], ne[1], ne[2], gate_up->nb[1], gate_up->nb[2], ne[0]*gate_up->nb[0]);
+        const float beta = 4.0f, lb = 25.0f;
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, cur, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, cur));
+        up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -8.0f, 8.0f);
+        }
+    }
+};
+
+struct test_clip_rows_fuse : public test_case {
+    const std::array<int64_t, 3> ne; // [n_embd_head, n_head, n_tokens]
+    const bool scaled;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "CLIP_ROWS_FUSE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-9; }
+    std::string vars() override { return VARS_TO_STR2(ne, scaled); }
+    test_clip_rows_fuse(std::array<int64_t, 3> ne = {128, 24, 2}, bool scaled = true) : ne(ne), scaled(scaled) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        ggml_set_name(cur, "cur");
+        if (scaled) {
+            ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(scale, "scale");
+            cur = ggml_mul(ctx, cur, scale);
+        }
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, 5.0f), norm);
+        ggml_tensor * out = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_snake_fuse : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;   // [T, C, D2, D3]
@@ -10779,6 +10832,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
+        test_cases.emplace_back(new test_situ_fuse({1152, 8, 1}));
+        test_cases.emplace_back(new test_situ_fuse({1152, 8, 7})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 512})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 333}));
+        test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 3}, true));
+        test_cases.emplace_back(new test_clip_rows_fuse({128, 8, 3}, false));
+        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true));
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two

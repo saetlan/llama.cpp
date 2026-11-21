@@ -511,6 +511,67 @@ typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
 
+// one SIMD group per row; the sum follows kernel_sum_rows_f32_f32_4 (one float4 per lane, simd_sum, horizontal sum)
+kernel void kernel_clip_rows_f32(
+        constant ggml_metal_kargs_clip_rows & args,
+        device const char * src,
+        device const char * scale,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+
+    float4 x = float4(0.0f);
+    if (tiisg < args.nl) {
+        x = ((device const float4 *) (src + i1*args.nb1 + i2*args.nb2))[tiisg];
+        if (args.has_scale) {
+            x = x * ((device const float4 *) (scale + i1*args.nbs1))[tiisg];
+        }
+    }
+
+    float4 s = simd_sum(x * x);
+
+    const float nrm = sqrt(sum(s));
+    const float n2  = args.sc * nrm + args.bi;
+    const float c   = clamp(args.thr / n2, args.lo, args.hi);
+
+    if (tiisg < args.nl) {
+        ((device float4 *) (dst + i1*args.nbd1 + i2*args.nbd2))[tiisg] = x * c;
+    }
+}
+
+kernel void kernel_situ_f32(
+        constant ggml_metal_kargs_situ & args,
+        device const char  * g,
+        device const char  * u,
+        device       float * dst,
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    // float4 lanes, like the unfused kernel_unary_f32_f32_4 / kernel_bin_fuse_f32_f32_f32_4 (same rounding)
+    const int ne0_4 = args.ne0/4;
+    const int i = tgpig*ntg + tpitg;
+    if (i >= ne0_4*args.ne1*args.ne2) {
+        return;
+    }
+    const int i0 = i % ne0_4;
+    const int i1 = (i / ne0_4) % args.ne1;
+    const int i2 = i / (ne0_4*args.ne1);
+
+    const float4 x = ((device const float4 *) (g + i2*args.nbg2 + i1*args.nbg1))[i0];
+    const float4 y = ((device const float4 *) (u + i2*args.nbu2 + i1*args.nbu1))[i0];
+
+    const float4 s1  = args.sc[0] * x + args.bi[0];
+    const float4 s2  = args.sc[1] * precise::tanh(s1) + args.bi[1];
+    const float4 sg  = 1 / (1 + exp(-x));
+    const float4 act = s2 * sg;
+    const float4 s3  = args.sc[2] * y + args.bi[2];
+    const float4 s4  = args.sc[3] * precise::tanh(s3) + args.bi[3];
+
+    ((device float4 *) dst)[i] = act * s4;
+}
+
 template <typename T>
 kernel void kernel_snake(
         constant ggml_metal_kargs_snake & args,

@@ -713,6 +713,33 @@ typedef struct {
 } ggml_metal_kargs_snake;
 
 typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nbu1;
+    uint64_t nbu2;
+    float    sc[4]; // the four SCALE nodes: scale
+    float    bi[4]; //                       bias
+} ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t  nl;     // float4 per row
+    int32_t  has_scale;
+    uint64_t nb1;    // cur strides
+    uint64_t nb2;
+    uint64_t nbs1;   // scale row stride
+    uint64_t nbd1;   // out strides
+    uint64_t nbd2;
+    float    sc;     // SCALE node: scale, bias
+    float    bi;
+    float    thr;    // FILL value
+    float    lo;     // CLAMP bounds
+    float    hi;
+} ggml_metal_kargs_clip_rows;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;
