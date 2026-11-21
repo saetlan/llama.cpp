@@ -67,6 +67,21 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+void llama_model_inkling2_loop::load_post_tensors() {
+    llama_model_inkling2::load_post_tensors();
+    if (getenv("LLAMA_INKLING_NO_PACK")) {
+        return;
+    }
+    for (size_t i = 0; i < loop_layers.size(); ++i) {
+        auto & l = loop_layers[i];
+        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
+            char name[GGML_MAX_NAME];
+            snprintf(name, sizeof(name), "loop.%zu.ctrl_gf.%d.packed", i + core_start, c);
+            l.ctrl_gf[c] = pack_weight_rows({ l.ctrl_gain[c], l.ctrl_forget[c] }, name);
+        }
+    }
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }
