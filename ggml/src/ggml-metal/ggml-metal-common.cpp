@@ -471,6 +471,14 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             case GGML_OP_CPY:
             case GGML_OP_CONT:
             case GGML_OP_REPEAT:
+            // plain src -> dst ops; several Inkling fusions start with them (CONCAT, SQR), and the mix/control
+            // inputs are CONCATs: stopping the lookahead there left many independent kernels serialised
+            case GGML_OP_CONCAT:
+            case GGML_OP_SQR:
+            case GGML_OP_SQRT:
+            case GGML_OP_FILL:
+            case GGML_OP_PAD:
+            case GGML_OP_SOFT_MAX:
                 return true;
             default:
                 return ggml_op_is_empty(op);
@@ -512,6 +520,11 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             // that many nodes forward to search for a concurrent node
             constexpr int N_FORWARD = 64;
 
+            // stop after this many candidates in a row that can't be moved: the checks grow with the window, and a
+            // wide whitelist otherwise scans the whole window at every barrier (CPU time on each graph rebuild)
+            constexpr int N_MISS_MAX = 8;
+            int n_miss = 0;
+
             for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
                 if (used[i1]) {
                     continue;
@@ -521,6 +534,9 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
 
                 // disallow reordering of certain ops
                 if (!h_safe(node1.op())) {
+                    break;
+                }
+                if (n_miss >= N_MISS_MAX) {
                     break;
                 }
 
@@ -536,9 +552,11 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
 
                     // mark as used, so we skip re-processing it later
                     used[i1] = true;
+                    n_miss = 0;
                 } else {
                     // expand the set of nodes that haven't been processed yet
                     h_add(mrs1, node1);
+                    n_miss++;
                 }
             }
 
