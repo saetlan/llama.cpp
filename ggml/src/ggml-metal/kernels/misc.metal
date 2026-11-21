@@ -642,6 +642,7 @@ kernel void kernel_sconv_f32(
         device const char * w,
         device       char * state,
         device       char * dst,
+        device const char * resid,
         uint tgpig [[threadgroup_position_in_grid]],
         uint tpitg [[thread_position_in_threadgroup]],
         uint ntg   [[threads_per_threadgroup]]) {
@@ -667,7 +668,13 @@ kernel void kernel_sconv_f32(
         conv += dot(float4(a, b, d, x), wc);
 
         const float r = x + conv;
-        ((device float *) (dst + tok*args.nbd1))[c] = args.sc * r + args.bi;
+        const float y = args.sc * r + args.bi;
+        if (args.has_res) {
+            const float rv = ((device const float *) (resid + tok*args.nbr1))[c];
+            ((device float *) (dst + tok*args.nbd1))[c] = rv + y;
+        } else {
+            ((device float *) (dst + tok*args.nbd1))[c] = y;
+        }
 
         a = b;
         b = d;

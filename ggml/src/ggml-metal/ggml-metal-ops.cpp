@@ -567,7 +567,7 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SCONV) {
             ctx->count_fusions(fusion);
-            return ggml_metal_op_sconv_fused(ctx, idx);
+            return ggml_metal_op_sconv_fused(ctx, idx, n);
         }
     }
 
@@ -5618,7 +5618,7 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
 }
 
 // Dispatch the fused short convolution; idx points at the CONCAT and the caller has validated the group.
-int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -5626,7 +5626,10 @@ int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * cpy  = ctx->node(idx + 1);
     const ggml_tensor * conv = ctx->node(idx + 2);
     const ggml_tensor * add  = ctx->node(idx + 3);
-    ggml_tensor       * scl  = ctx->node(idx + 4);
+    const ggml_tensor * scl  = ctx->node(idx + 4);
+    ggml_tensor       * res  = n == 6 ? ctx->node(idx + 5) : nullptr;
+    ggml_tensor       * out  = res ? res : (ggml_tensor *) scl;
+    const ggml_tensor * resid = res ? (res->src[0] == scl ? res->src[1] : res->src[0]) : nullptr;
 
     const ggml_tensor * past = cat->src[0];
     const ggml_tensor * xt   = cat->src[1];
@@ -5634,7 +5637,7 @@ int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * cur  = add->src[0];
     const ggml_tensor * cell = cpy->src[1];
 
-    for (int i = 1; i < 5; ++i) {
+    for (int i = 1; i < n; ++i) {
         if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
             ggml_metal_op_concurrency_reset(ctx);
             break;
@@ -5650,7 +5653,9 @@ int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx) {
     args.nbw1 = w->nb[1];
     args.nbx1 = cur->nb[1];
     args.nbs1 = cell->nb[1];
-    args.nbd1 = scl->nb[1];
+    args.nbd1 = out->nb[1];
+    args.nbr1 = resid ? resid->nb[1] : 0;
+    args.has_res = resid ? 1 : 0;
     args.sc   = ggml_get_op_params_f32(scl, 0);
     args.bi   = ggml_get_op_params_f32(scl, 1);
 
@@ -5662,13 +5667,14 @@ int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur),  2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),    3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell), 4);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scl),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(resid ? resid : cur), 6);
 
     const int total = args.C*args.S;
     const int nth   = 256;
     ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
 
-    return 5;
+    return n;
 }
 
 // Dispatch the fused control blend; idx points at the forget TANH and the caller has validated the group.

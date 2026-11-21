@@ -484,14 +484,17 @@ static bool ggml_metal_fusion_check_sconv(
         const int                     * node_idxs,
               int                       idx,
               ggml_metal_fusion_mode    mode) {
+    const bool has_res = fusion->ops.size() == 6;
     const ggml_tensor * cat  = nodes[0];
     const ggml_tensor * cpy  = nodes[1];
     const ggml_tensor * conv = nodes[2];
     const ggml_tensor * add  = nodes[3];
     const ggml_tensor * scl  = nodes[4];
+    const ggml_tensor * res  = has_res ? nodes[5] : nullptr;
+    const ggml_tensor * out  = has_res ? res : scl;
 
     const int r0 = node_idxs[idx];
-    const int r1 = node_idxs[idx + 4];
+    const int r1 = node_idxs[idx + (has_res ? 5 : 4)];
     if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
         return false;
     }
@@ -512,6 +515,16 @@ static bool ggml_metal_fusion_check_sconv(
     if (ggml_get_op_params_i32(cat, 0) != 0 || last->view_src != cat || cpy->src[0] != last || cpy->src[1] != cell ||
         conv->src[0] != cat || outv->src[0] != conv || add->src[1] != outv || scl->src[0] != add) {
         return false;
+    }
+    // residual: out = resid + scl (either operand order), same shape, contiguous
+    const ggml_tensor * resid = nullptr;
+    if (has_res) {
+        resid = res->src[0] == scl ? res->src[1] : res->src[0];
+        if ((res->src[0] != scl && res->src[1] != scl) || resid == nullptr || resid->type != GGML_TYPE_F32 ||
+            res->type != GGML_TYPE_F32 || !ggml_are_same_shape(res, scl) || !ggml_are_same_shape(resid, scl) ||
+            !ggml_is_contiguous(res) || !ggml_is_contiguous(resid)) {
+            return false;
+        }
     }
 
     const int64_t nc = 4;
@@ -542,10 +555,10 @@ static bool ggml_metal_fusion_check_sconv(
         return false;
     }
 
-    // every node except the final SCALE (and the side-effect CPY) is consumed only inside the group
+    // every node except the output (and the side-effect CPY) is consumed only inside the group
     for (int r = r0; r <= r1; ++r) {
         const ggml_tensor * node = gf->nodes[r];
-        if (node == scl || node == cpy) {
+        if (node == out || node == cpy) {
             continue;
         }
         if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
@@ -576,9 +589,12 @@ static bool ggml_metal_fusion_check_sconv(
             const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
             return a0 < b1 && b0 < a1;
         };
-        if (overlap(scl, root(past)) || overlap(scl, root(w)) || overlap(scl, root(cell)) ||
+        // out is written element for element in the layout of cur (and of resid): only an exact in-place alias is safe
+        if (overlap(out, root(past)) || overlap(out, root(w)) || overlap(out, root(cell)) ||
             overlap(cell, root(past)) || overlap(cell, root(cur)) ||
-            (overlap(scl, root(cur)) && scl->data != cur->data)) {
+            (overlap(out, root(cur)) && out->data != cur->data) ||
+            (resid && overlap(cell, root(resid))) ||
+            (resid && overlap(out, root(resid)) && out->data != resid->data)) {
             return false;
         }
     }
@@ -1346,6 +1362,8 @@ static const std::vector<ggml_op> ops_ctrl_mix      = { GGML_OP_UNARY, GGML_OP_M
 static const std::vector<ggml_op> ops_ctrl_mix_nov  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_sconv = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
                                                 GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_sconv_res = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
+                                                    GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT,
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
@@ -1408,6 +1426,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
     { GGML_METAL_FUSION_RELPOS, ops_relpos, {}, true, ggml_metal_fusion_check_relpos },
     { GGML_METAL_FUSION_SCONV, ops_sconv, {}, true,  ggml_metal_fusion_check_sconv },
+    { GGML_METAL_FUSION_SCONV, ops_sconv_res, {}, true, ggml_metal_fusion_check_sconv },
     { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix,     {}, true, ggml_metal_fusion_check_ctrl_mix },
     { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix_nov, {}, true, ggml_metal_fusion_check_ctrl_mix },
     { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows,        {}, true, ggml_metal_fusion_check_clip_rows },

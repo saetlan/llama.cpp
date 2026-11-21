@@ -758,6 +758,8 @@ typedef struct {
     uint64_t nbx1;  // cur row stride (one token)
     uint64_t nbs1;  // state cell row stride (one sequence)
     uint64_t nbd1;  // out row stride (one token)
+    uint64_t nbr1;  // residual row stride (one token)
+    int32_t  has_res;
     float    sc;    // SCALE
     float    bi;
 } ggml_metal_kargs_sconv;
