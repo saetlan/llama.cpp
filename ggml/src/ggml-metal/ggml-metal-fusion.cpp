@@ -551,7 +551,8 @@ static bool ggml_metal_fusion_check_sconv(
     if (xt->data != cur->data && mode == GGML_METAL_FUSION_FULL) {
         return false;
     }
-    if (xt->nb[1] != sizeof(float) || xt->nb[0] != cur->nb[1] || xt->nb[2] != T*cur->nb[1]) {
+    // the token strides only matter for prompt batches (one token: cur may be a row view of a packed product)
+    if (xt->nb[1] != sizeof(float) || (T > 1 && (xt->nb[0] != cur->nb[1] || xt->nb[2] != T*cur->nb[1]))) {
         return false;
     }
 
@@ -874,8 +875,8 @@ static bool ggml_metal_fusion_check_sconv_dyn(
         if (!mw || mw->op != GGML_OP_RESHAPE || mw->src[0] != ct || !tp || tp->op != GGML_OP_VIEW) {
             return false;
         }
-        const ggml_tensor * d3 = tp->src[0];  // reshape_3d of the projection
-        if (!d3 || d3->op != GGML_OP_RESHAPE || d3->ne[0] != 4 || tp->view_offs != (size_t) lag*sizeof(float)) {
+        const ggml_tensor * d3 = tp->src[0];  // reshape_3d of the projection (itself possibly a view of a packed product)
+        if (!d3 || d3->op != GGML_OP_RESHAPE || d3->ne[0] != 4 || tp->view_offs != d3->view_offs + (size_t) lag*sizeof(float)) {
             return false;
         }
         if (dyn == nullptr) {

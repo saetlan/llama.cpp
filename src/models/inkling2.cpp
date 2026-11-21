@@ -165,9 +165,21 @@ void llama_model_inkling2::load_post_tensors() {
         const auto & layer = layers[i];
         char name[GGML_MAX_NAME];
         snprintf(name, sizeof(name), "blk.%d.attn_qgrs.packed", i);
-        ggml_tensor * packed = pack_weight_rows({ layer.wq, layer.wqkv_gate, layer.attn_rel, layer.attn_sink_proj }, name);
+        ggml_tensor * packed = hparams.is_swa(i)
+            ? pack_weight_rows({ layer.wq, layer.wqkv_gate, layer.attn_rel, layer.attn_sink_proj, layer.wk, layer.wv }, name)
+            : pack_weight_rows({ layer.wq, layer.wqkv_gate, layer.attn_rel, layer.attn_sink_proj }, name);
         if (packed) {
             qgrs[layer.wq] = packed;
+        }
+        if (!hparams.is_swa(i) && layer.attn_k_conv_proj && layer.attn_v_conv_proj) {
+            snprintf(name, sizeof(name), "blk.%d.attn_kd.packed", i);
+            if (ggml_tensor * kd = pack_weight_rows({ layer.wk, layer.attn_k_conv_proj }, name)) {
+                kdyn[layer.wk] = kd;
+            }
+            snprintf(name, sizeof(name), "blk.%d.attn_vd.packed", i);
+            if (ggml_tensor * vd = pack_weight_rows({ layer.wv, layer.attn_v_conv_proj }, name)) {
+                kdyn[layer.wv] = vd;
+            }
         }
     }
 }
@@ -420,13 +432,24 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks_lin = nullptr;
         ggml_tensor * Q_lin     = nullptr;
         ggml_tensor * R_lin     = nullptr;
+        ggml_tensor * K_lin     = nullptr;
+        ggml_tensor * V_lin     = nullptr;
+        ggml_tensor * Kd_lin    = nullptr; // dynamic tap projections (full-attention layers)
+        ggml_tensor * Vd_lin    = nullptr;
         {
             const auto & m = static_cast<const llama_model_inkling2 &>(model);
             auto it = n_tokens == 1 ? m.qgrs.find(layer.wq) : m.qgrs.end();
             if (it != m.qgrs.end()) {
-                const int64_t nq = n_embd_head*n_head;
-                const int64_t nr = hparams.n_relative*n_head;
-                ggml_tensor * y = build_lora_mm(it->second, inputs[0]);
+                const int64_t nq   = n_embd_head*n_head;
+                const int64_t nr   = hparams.n_relative*n_head;
+                const int64_t nqgrs = 2*nq + nr + n_head;
+                ggml_tensor * w = it->second;
+                // K and V share the packed matvec only when all three inputs are the same tensor
+                const bool kv = w->ne[1] == nqgrs + 2*n_embd_k_gqa && inputs[1] == inputs[0] && inputs[2] == inputs[0];
+                if (!kv && w->ne[1] != nqgrs) {
+                    w = ggml_view_2d(ctx0, w, w->ne[0], nqgrs, w->nb[1], 0);
+                }
+                ggml_tensor * y = build_lora_mm(w, inputs[0]);
                 Q_lin     = ggml_view_2d(ctx0, y, nq,     1, y->nb[1], 0);
                 gate_lin  = ggml_view_2d(ctx0, y, nq,     1, y->nb[1], nq*sizeof(float));
                 R_lin     = ggml_view_2d(ctx0, y, nr,     1, y->nb[1], 2*nq*sizeof(float));
@@ -436,14 +459,37 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 ggml_build_forward_expand(gf, gate_lin);
                 ggml_build_forward_expand(gf, R_lin);
                 ggml_build_forward_expand(gf, sinks_lin);
+                if (kv) {
+                    K_lin = ggml_view_2d(ctx0, y, n_embd_k_gqa, 1, y->nb[1], nqgrs*sizeof(float));
+                    V_lin = ggml_view_2d(ctx0, y, n_embd_k_gqa, 1, y->nb[1], (nqgrs + n_embd_k_gqa)*sizeof(float));
+                    ggml_build_forward_expand(gf, K_lin);
+                    ggml_build_forward_expand(gf, V_lin);
+                }
+            }
+            if (n_tokens == 1 && !is_swa) {
+                auto ik = m.kdyn.find(layer.wk);
+                auto iv = m.kdyn.find(layer.wv);
+                if (ik != m.kdyn.end() && iv != m.kdyn.end()) {
+                    const int64_t nd = layer.attn_k_conv_proj->ne[1];
+                    ggml_tensor * yk = build_lora_mm(ik->second, inputs[1]);
+                    ggml_tensor * yv = build_lora_mm(iv->second, inputs[2]);
+                    K_lin  = ggml_view_2d(ctx0, yk, n_embd_k_gqa, 1, yk->nb[1], 0);
+                    Kd_lin = ggml_view_2d(ctx0, yk, nd,           1, yk->nb[1], n_embd_k_gqa*sizeof(float));
+                    V_lin  = ggml_view_2d(ctx0, yv, n_embd_k_gqa, 1, yv->nb[1], 0);
+                    Vd_lin = ggml_view_2d(ctx0, yv, nd,           1, yv->nb[1], n_embd_k_gqa*sizeof(float));
+                    ggml_build_forward_expand(gf, K_lin);
+                    ggml_build_forward_expand(gf, Kd_lin);
+                    ggml_build_forward_expand(gf, V_lin);
+                    ggml_build_forward_expand(gf, Vd_lin);
+                }
             }
         }
 
         ggml_tensor * Qcur = Q_lin ? Q_lin : build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
+        ggml_tensor * Kcur = convolve(K_lin ? K_lin : build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
+                is_swa ? nullptr : (Kd_lin ? Kd_lin : build_lora_mm(layer.attn_k_conv_proj, inputs[1])), state, history, recr, 0);
+        ggml_tensor * Vcur = convolve(V_lin ? V_lin : build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
+                is_swa ? nullptr : (Vd_lin ? Vd_lin : build_lora_mm(layer.attn_v_conv_proj, inputs[2])), state, history, recr, n_embd_k_gqa);
         ggml_tensor * Rcur = R_lin ? R_lin : build_lora_mm(layer.attn_rel, inputs[0]);
 
         Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);

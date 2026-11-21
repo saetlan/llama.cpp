@@ -2506,8 +2506,10 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * ctrl_gf[LOOP_CTRL_COUNT]     = {}; // hill-climb: [gain | forget] rows, packed after load
     };
 
-    // hill-climb: per physical layer (keyed by wq), the rows of wq, wqkv_gate, attn_rel and attn_sink_proj packed
+    // hill-climb: per physical layer (keyed by wq), the rows of wq, wqkv_gate, attn_rel and attn_sink_proj packed,
+    // followed by wk and wv on SWA layers; on full-attention layers wk|attn_k_conv_proj and wv|attn_v_conv_proj
     std::map<const ggml_tensor *, ggml_tensor *> qgrs;
+    std::map<const ggml_tensor *, ggml_tensor *> kdyn;
     void load_post_tensors() override;
 
     struct graph : public llm_graph_context {
