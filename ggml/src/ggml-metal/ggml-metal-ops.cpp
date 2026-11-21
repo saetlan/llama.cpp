@@ -831,6 +831,16 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // inkling2 control blend anchors at the forget TANH
+    if (op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_TANH && ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CTRL_MIX) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_ctrl_mix_fused(ctx, idx);
+        }
+    }
+
     // situ GLU anchors at its leading SCALE
     if (op->op == GGML_OP_SCALE && ctx->use_fusion()) {
         int n = 1;
@@ -5442,6 +5452,54 @@ int ggml_metal_op_clip_rows_fused(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[1], out->ne[2], 1, std::min(32, (int) args.nl), 1, 1);
 
     return n;
+}
+
+// Dispatch the fused control blend; idx points at the forget TANH and the caller has validated the group.
+int ggml_metal_op_ctrl_mix_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * tf = ctx->node(idx + 0);
+    const ggml_tensor * sb = ctx->node(idx + 2);
+    const ggml_tensor * tg = ctx->node(idx + 3);
+    const ggml_tensor * m2 = ctx->node(idx + 4);
+    ggml_tensor       * ad = ctx->node(idx + 5);
+
+    const ggml_tensor * c = sb->src[0];
+    const ggml_tensor * m = m2->src[1];
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+
+    for (int i = 1; i < 6; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_ctrl_mix args = {};
+    args.ne0  = (int32_t) ad->ne[0];
+    args.ne1  = (int32_t) ad->ne[1];
+    args.nbc1 = c->nb[1];
+    args.nbm1 = m->nb[1];
+    args.nbf1 = f->nb[1];
+    args.nbg1 = g->nb[1];
+
+    auto pipeline = ggml_metal_library_get_pipeline_ctrl_mix(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(c),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(f),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ad), 5);
+
+    const int total = args.ne0*args.ne1;
+    const int nth   = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 6;
 }
 
 // Dispatch the fused situ kernel; idx points at the leading SCALE and the caller has validated the group.

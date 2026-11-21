@@ -740,6 +740,15 @@ typedef struct {
 } ggml_metal_kargs_clip_rows;
 
 typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nbc1; // row strides of c, m, f, g
+    uint64_t nbm1;
+    uint64_t nbf1;
+    uint64_t nbg1;
+} ggml_metal_kargs_ctrl_mix;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

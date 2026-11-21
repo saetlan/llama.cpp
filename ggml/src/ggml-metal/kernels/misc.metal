@@ -541,6 +541,37 @@ kernel void kernel_clip_rows_f32(
     }
 }
 
+kernel void kernel_ctrl_mix_f32(
+        constant ggml_metal_kargs_ctrl_mix & args,
+        device const char  * c,
+        device const char  * m,
+        device const char  * f,
+        device const char  * g,
+        device       float * dst,
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+#pragma clang fp contract(off)
+    const int i = tgpig*ntg + tpitg;
+    if (i >= args.ne0*args.ne1) {
+        return;
+    }
+    const int i0 = i % args.ne0;
+    const int i1 = i / args.ne0;
+
+    const float cv = ((device const float *) (c + i1*args.nbc1))[i0];
+    const float mv = ((device const float *) (m + i1*args.nbm1))[i0];
+    const float fv = ((device const float *) (f + i1*args.nbf1))[i0];
+    const float gv = ((device const float *) (g + i1*args.nbg1))[i0];
+
+    // same rounding steps as the unfused TANH, MUL, SUB, TANH, MUL, ADD kernels
+    const float t1 = precise::tanh(fv) * cv;
+    const float s  = cv - t1;
+    const float t2 = precise::tanh(gv) * mv;
+
+    dst[i] = s + t2;
+}
+
 kernel void kernel_situ_f32(
         constant ggml_metal_kargs_situ & args,
         device const char  * g,

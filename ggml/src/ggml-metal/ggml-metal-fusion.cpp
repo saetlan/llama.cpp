@@ -427,6 +427,52 @@ static bool ggml_metal_fusion_check_clip_rows(
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
 }
 
+// inkling2 control(): out = (c - tanh(f)*c) + tanh(g)*m, as TANH(f) MUL SUB TANH(g) MUL ADD (validated here, unsafe = true)
+static bool ggml_metal_fusion_check_ctrl_mix(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * tf = nodes[0];
+    const ggml_tensor * m1 = nodes[1];
+    const ggml_tensor * sb = nodes[2];
+    const ggml_tensor * tg = nodes[3];
+    const ggml_tensor * m2 = nodes[4];
+    const ggml_tensor * ad = nodes[5];
+
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    // the kernel computes forget*c, gain*m and sub + mul in exactly these operand orders
+    if (m1->src[0] != tf || sb->src[1] != m1 || m1->src[1] != sb->src[0] || m2->src[0] != tg ||
+        ad->src[0] != sb || ad->src[1] != m2) {
+        return false;
+    }
+
+    const ggml_tensor * c = sb->src[0];
+    const ggml_tensor * m = m2->src[1];
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+
+    const ggml_tensor * all[] = { c, m, f, g, tf, m1, sb, tg, m2, ad };
+    for (const ggml_tensor * t : all) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, ad)) {
+            return false;
+        }
+    }
+    if (ad->ne[2] != 1 || ad->ne[3] != 1 || !ggml_is_contiguous_rows(c) || !ggml_is_contiguous_rows(m) ||
+        !ggml_is_contiguous_rows(f) || !ggml_is_contiguous_rows(g) || !ggml_is_contiguous(ad)) {
+        return false;
+    }
+
+    int outputs[1] = { node_idxs[idx + 5] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 6, fusion->ops.data(), outputs, 1);
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -973,6 +1019,9 @@ static const std::vector<ggml_op> ops_clip_rows        = { GGML_OP_SQR, GGML_OP_
 static const std::vector<ggml_op> ops_clip_rows_scaled = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
                                                           GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
 // raw order includes the VIEW of up (gate_up second half), which the graph visits right before its SCALE
+// raw order: the message VIEW (m) is visited right before its MUL when nothing read it earlier
+static const std::vector<ggml_op> ops_ctrl_mix      = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_ctrl_mix_nov  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                 GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
@@ -1027,6 +1076,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix,     {}, true, ggml_metal_fusion_check_ctrl_mix },
+    { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix_nov, {}, true, ggml_metal_fusion_check_ctrl_mix },
     { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows,        {}, true, ggml_metal_fusion_check_clip_rows },
     { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows_scaled, {}, true, ggml_metal_fusion_check_clip_rows },
 

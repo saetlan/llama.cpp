@@ -4643,6 +4643,31 @@ struct test_situ_fuse : public test_case {
     }
 };
 
+struct test_ctrl_mix_fuse : public test_case {
+    const std::array<int64_t, 2> ne; // [n_embd, n_tokens]
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "CTRL_MIX_FUSE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-9; }
+    std::string vars() override { return VARS_TO_STR1(ne); }
+    test_ctrl_mix_fuse(std::array<int64_t, 2> ne = {2304, 2}) : ne(ne) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // c and m are row views of wider tensors, like the mixed inputs and the messages
+        ggml_tensor * mixed    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], 3, ne[1]);
+        ggml_tensor * messages = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], 4, ne[1]);
+        ggml_set_name(mixed, "mixed"); ggml_set_name(messages, "messages");
+        ggml_tensor * c = ggml_view_2d(ctx, mixed,    ne[0], ne[1], mixed->nb[2],    1*mixed->nb[1]);
+        ggml_tensor * m = ggml_view_2d(ctx, messages, ne[0], ne[1], messages->nb[2], 2*messages->nb[1]);
+        ggml_tensor * gpre = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * fpre = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(gpre, "gpre"); ggml_set_name(fpre, "fpre");
+        ggml_tensor * gain   = ggml_tanh(ctx, gpre);
+        ggml_tensor * forget = ggml_tanh(ctx, fpre);
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, c, ggml_mul(ctx, forget, c)), ggml_mul(ctx, gain, m));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_clip_rows_fuse : public test_case {
     const std::array<int64_t, 3> ne; // [n_embd_head, n_head, n_tokens]
     const bool scaled;
@@ -10836,7 +10861,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_situ_fuse({1152, 8, 7})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 512})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 333}));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 3}, true));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 8, 3}, false));
-        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true));
+        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two

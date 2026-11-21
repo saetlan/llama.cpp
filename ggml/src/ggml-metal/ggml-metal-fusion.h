@@ -45,6 +45,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
     GGML_METAL_FUSION_SITU,         // SCALE + TANH + SCALE + SIGMOID + MUL + SCALE + TANH + SCALE + MUL (situ GLU)
     GGML_METAL_FUSION_CLIP_ROWS,    // [MUL] + SQR + SUM_ROWS + SQRT + SCALE + FILL + DIV + CLAMP + MUL (row L2 clip)
+    GGML_METAL_FUSION_CTRL_MIX,     // TANH + MUL + SUB + TANH + MUL + ADD: (c - tanh(f)*c) + tanh(g)*m
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
