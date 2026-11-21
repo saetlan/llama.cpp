@@ -473,6 +473,119 @@ static bool ggml_metal_fusion_check_ctrl_mix(
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 6, fusion->ops.data(), outputs, 1);
 }
 
+// inkling2 convolve() without dynamic taps, n_conv = 4:
+//   x = concat(past, cur^T, 0); state <- x[last 3]; out = (cur + ssm_conv(x, w))*scale
+// raw: CONCAT VIEW(last) VIEW(cell) CPY SSM_CONV RESHAPE ADD SCALE. The CPY writes through a view of the recurrent
+// state, which the generic subgraph check rejects, so the use counts are checked here directly.
+static bool ggml_metal_fusion_check_sconv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * cat  = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+    const ggml_tensor * conv = nodes[2];
+    const ggml_tensor * add  = nodes[3];
+    const ggml_tensor * scl  = nodes[4];
+
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 4];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * last = gf->nodes[r0 + 1];
+    const ggml_tensor * cell = gf->nodes[r0 + 2];
+    const ggml_tensor * outv = gf->nodes[r0 + 5];
+
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * xt   = cat->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * cur  = add->src[0];
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || last->view_src != cat || cpy->src[0] != last || cpy->src[1] != cell ||
+        conv->src[0] != cat || outv->src[0] != conv || add->src[1] != outv || scl->src[0] != add) {
+        return false;
+    }
+
+    const int64_t nc = 4;
+    const int64_t C  = cat->ne[1];
+    const int64_t S  = cat->ne[2];
+    const int64_t T  = xt->ne[0];
+
+    const ggml_tensor * f32s[] = { cat, past, xt, w, cur, conv, add, scl, cell };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (past->ne[0] != nc - 1 || past->ne[1] != C || past->ne[2] != S || xt->ne[1] != C || xt->ne[2] != S ||
+        cat->ne[0] != nc - 1 + T || cat->ne[3] != 1 || w->ne[0] != nc || w->ne[1] != C || !ggml_is_contiguous(w) ||
+        !ggml_is_contiguous(cat) || last->ne[0] != nc - 1 || last->ne[1] != C || last->ne[2] != S ||
+        last->view_offs != (size_t) T*sizeof(float) || cell->ne[0] != (nc - 1)*C || cell->ne[1] != S ||
+        cell->nb[0] != sizeof(float) || conv->ne[0] != C || conv->ne[1] != T || conv->ne[2] != S ||
+        cur->ne[0] != C || cur->ne[1] != T*S || !ggml_is_contiguous(cur) || !ggml_is_contiguous(scl) ||
+        !ggml_are_same_shape(add, scl) || !ggml_are_same_shape(add, cur) || past->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // xt is cur^T: element (t, c, s) at cur + (s*T + t)*row + c*4
+    if (xt->data != cur->data && mode == GGML_METAL_FUSION_FULL) {
+        return false;
+    }
+    if (xt->nb[1] != sizeof(float) || xt->nb[0] != cur->nb[1] || xt->nb[2] != T*cur->nb[1]) {
+        return false;
+    }
+
+    // every node except the final SCALE (and the side-effect CPY) is consumed only inside the group
+    for (int r = r0; r <= r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node == scl || node == cpy) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+    if (ggml_node_get_use_count(gf, r0 + 3) != 0) {
+        return false;
+    }
+
+    // the kernel writes out and the state; out may only alias cur element for element (in place)
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(scl, root(past)) || overlap(scl, root(w)) || overlap(scl, root(cell)) ||
+            overlap(cell, root(past)) || overlap(cell, root(cur)) ||
+            (overlap(scl, root(cur)) && scl->data != cur->data)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1022,6 +1135,8 @@ static const std::vector<ggml_op> ops_clip_rows_scaled = { GGML_OP_MUL, GGML_OP_
 // raw order: the message VIEW (m) is visited right before its MUL when nothing read it earlier
 static const std::vector<ggml_op> ops_ctrl_mix      = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_ctrl_mix_nov  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_sconv = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
+                                                GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                 GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
@@ -1076,6 +1191,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_SCONV, ops_sconv, {}, true,  ggml_metal_fusion_check_sconv },
     { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix,     {}, true, ggml_metal_fusion_check_ctrl_mix },
     { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix_nov, {}, true, ggml_metal_fusion_check_ctrl_mix },
     { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows,        {}, true, ggml_metal_fusion_check_clip_rows },

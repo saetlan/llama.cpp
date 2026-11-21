@@ -541,6 +541,53 @@ kernel void kernel_clip_rows_f32(
     }
 }
 
+// one thread per (channel, sequence): roll the 4-wide window over the tokens, like kernel_ssm_conv_f32_f32_4
+// (dot of the window with the weights), then add the input and scale; the last 3 inputs become the new state
+kernel void kernel_sconv_f32(
+        constant ggml_metal_kargs_sconv & args,
+        device const char * past,
+        device const char * cur,
+        device const char * w,
+        device       char * state,
+        device       char * dst,
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    const int i = tgpig*ntg + tpitg;
+    if (i >= args.C*args.S) {
+        return;
+    }
+    const int c = i % args.C;
+    const int s = i / args.C;
+
+    device const float * p = (device const float *) (past + c*args.nbp1 + s*args.nbp2);
+    float a = p[0];
+    float b = p[1];
+    float d = p[2];
+
+    const float4 wc = *((device const float4 *) (w + c*args.nbw1));
+
+    for (int t = 0; t < args.T; ++t) {
+        const int64_t tok = (int64_t) s*args.T + t;
+        const float x = ((device const float *) (cur + tok*args.nbx1))[c];
+
+        float conv = 0.0f;
+        conv += dot(float4(a, b, d, x), wc);
+
+        const float r = x + conv;
+        ((device float *) (dst + tok*args.nbd1))[c] = args.sc * r + args.bi;
+
+        a = b;
+        b = d;
+        d = x;
+    }
+
+    device float * st = (device float *) (state + s*args.nbs1) + 3*c;
+    st[0] = a;
+    st[1] = b;
+    st[2] = d;
+}
+
 kernel void kernel_ctrl_mix_f32(
         constant ggml_metal_kargs_ctrl_mix & args,
         device const char  * c,

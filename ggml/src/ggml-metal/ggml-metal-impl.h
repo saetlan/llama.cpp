@@ -749,6 +749,20 @@ typedef struct {
 } ggml_metal_kargs_ctrl_mix;
 
 typedef struct {
+    int32_t  C;
+    int32_t  T;
+    int32_t  S;
+    uint64_t nbp1;  // past (3, C, S) strides
+    uint64_t nbp2;
+    uint64_t nbw1;  // weight row (4 floats per channel)
+    uint64_t nbx1;  // cur row stride (one token)
+    uint64_t nbs1;  // state cell row stride (one sequence)
+    uint64_t nbd1;  // out row stride (one token)
+    float    sc;    // SCALE
+    float    bi;
+} ggml_metal_kargs_sconv;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;
