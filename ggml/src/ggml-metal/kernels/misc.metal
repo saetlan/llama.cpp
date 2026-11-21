@@ -543,6 +543,46 @@ kernel void kernel_clip_rows_f32(
 
 // one thread per (channel, sequence): roll the 4-wide window over the tokens, like kernel_ssm_conv_f32_f32_4
 // (dot of the window with the weights), then add the input and scale; the last 3 inputs become the new state
+// f16 per-head mask: out[kv, t, h, s] = f16((sum_i bias[i, rp] * R[i, h, tok] - sinks[h, tok]) + mask[kv, t, 0, s])
+kernel void kernel_relpos_mask_f32(
+        constant ggml_metal_kargs_relpos & args,
+        device const char * bias,
+        device const char * R,
+        device const char * sinks,
+        device const char * relp,
+        device const char * mask,
+        device       half * dst,
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    const int64_t i = (int64_t) tgpig*ntg + tpitg;
+    const int64_t n = (int64_t) args.NK*args.Ts*args.H*args.S;
+    if (i >= n) {
+        return;
+    }
+    const int kv   = i % args.NK;
+    int64_t   rest = i / args.NK;
+    const int t    = rest % args.Ts; rest /= args.Ts;
+    const int h    = rest % args.H;
+    const int s    = rest / args.H;
+    const int tok  = s*args.Ts + t;
+
+    const int rp = ((device const int32_t *) (relp + tok*args.nbp1))[kv];
+
+    device const float * b = (device const float *) (bias + rp*args.nbb1);
+    device const float * r = (device const float *) (R + h*args.nbR1 + tok*args.nbR2);
+
+    float v = 0.0f;
+    for (int k = 0; k < args.NR; ++k) {
+        v += b[k] * r[k];
+    }
+    v = v - ((device const float *) (sinks + tok*args.nbs1))[h];
+
+    const float m = ((device const float *) (mask + (args.mne1 == 1 ? 0 : t)*args.nbm1 + (args.mne3 == 1 ? 0 : s)*args.nbm3))[kv];
+
+    dst[i] = (half) (v + m);
+}
+
 kernel void kernel_sconv_f32(
         constant ggml_metal_kargs_sconv & args,
         device const char * past,

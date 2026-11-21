@@ -2767,6 +2767,15 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_RELPOS) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_relpos_fused(ctx, idx);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -5461,6 +5470,64 @@ int ggml_metal_op_clip_rows_fused(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[1], out->ne[2], 1, std::min(32, (int) args.nl), 1, 1);
 
     return n;
+}
+
+// Dispatch the fused rel-pos mask; idx points at the bias-table MUL_MAT and the caller has validated the group.
+int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mm  = ctx->node(idx + 0);
+    const ggml_tensor * sub = ctx->node(idx + 1);
+    const ggml_tensor * gr  = ctx->node(idx + 3);
+    const ggml_tensor * add = ctx->node(idx + 5);
+    ggml_tensor       * cpy = ctx->node(idx + 6);
+
+    const ggml_tensor * bias  = mm->src[0];
+    const ggml_tensor * R     = mm->src[1];
+    const ggml_tensor * sinks = sub->src[1]->src[0];
+    const ggml_tensor * relp  = gr->src[1];
+    const ggml_tensor * mask  = add->src[1];
+
+    for (int i = 1; i < 7; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_relpos args = {};
+    args.NR   = (int32_t) bias->ne[0];
+    args.H    = (int32_t) R->ne[1];
+    args.NK   = (int32_t) cpy->ne[0];
+    args.Ts   = (int32_t) cpy->ne[1];
+    args.S    = (int32_t) cpy->ne[3];
+    args.mne1 = (int32_t) mask->ne[1];
+    args.mne3 = (int32_t) mask->ne[3];
+    args.nbb1 = bias->nb[1];
+    args.nbR1 = R->nb[1];
+    args.nbR2 = R->nb[2];
+    args.nbs1 = sinks->nb[1];
+    args.nbp1 = relp->nb[1];
+    args.nbm1 = mask->nb[1];
+    args.nbm3 = mask->nb[3];
+
+    auto pipeline = ggml_metal_library_get_pipeline_relpos(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(R),     2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sinks), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(relp),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy),   6);
+
+    const int64_t total = (int64_t) args.NK*args.Ts*args.H*args.S;
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((total + nth - 1)/nth), 1, 1, nth, 1, 1);
+
+    return 7;
 }
 
 // Dispatch the fused short convolution; idx points at the CONCAT and the caller has validated the group.

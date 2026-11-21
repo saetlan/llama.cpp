@@ -586,6 +586,110 @@ static bool ggml_metal_fusion_check_sconv(
     return true;
 }
 
+// inkling2 rel-pos bias into the per-head flash-attention mask:
+//   table = bias_pad^T R - sinks; kq_b = table[:, rel_pos]; mask16 = f16(kq_b + mask)
+// raw: MUL_MAT RESHAPE SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT ADD CPY
+static bool ggml_metal_fusion_check_relpos(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * mm    = nodes[0];
+    const ggml_tensor * sub   = nodes[1];
+    const ggml_tensor * cont1 = nodes[2];
+    const ggml_tensor * gr    = nodes[3];
+    const ggml_tensor * cont2 = nodes[4];
+    const ggml_tensor * add   = nodes[5];
+    const ggml_tensor * cpy   = nodes[6];
+
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 6];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * sinks_r = gf->nodes[r0 + 1];
+    const ggml_tensor * perm1   = gf->nodes[r0 + 3];
+    const ggml_tensor * resh2   = gf->nodes[r0 + 6];
+    const ggml_tensor * perm2   = gf->nodes[r0 + 7];
+
+    const ggml_tensor * bias  = mm->src[0];
+    const ggml_tensor * R     = mm->src[1];
+    const ggml_tensor * sinks = sinks_r->src[0];
+    const ggml_tensor * relp  = gr->src[1];
+    const ggml_tensor * mask  = add->src[1];
+
+    if (sub->src[0] != mm || sub->src[1] != sinks_r || perm1->src[0] != sub || cont1->src[0] != perm1 ||
+        gr->src[0] != cont1 || resh2->src[0] != gr || perm2->src[0] != resh2 || cont2->src[0] != perm2 ||
+        add->src[0] != cont2 || cpy->src[0] != add || cpy->src[1] != cpy || sinks == nullptr) {
+        return false;
+    }
+
+    const int64_t NR = bias->ne[0];   // relative features (16)
+    const int64_t Ep = bias->ne[1];   // table rows (extent + 1)
+    const int64_t H  = R->ne[1];
+    const int64_t T  = R->ne[2];
+    const int64_t NK = relp->ne[0];
+
+    if (bias->type != GGML_TYPE_F32 || R->type != GGML_TYPE_F32 || sinks->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 ||
+        relp->type != GGML_TYPE_I32 || cpy->type != GGML_TYPE_F16 || add->type != GGML_TYPE_F32 ||
+        R->ne[0] != NR || NR > 32 || !ggml_is_contiguous(bias) || !ggml_is_contiguous_rows(R) ||
+        sinks->ne[0] != H || sinks->ne[1] != T || !ggml_is_contiguous_rows(sinks) ||
+        relp->ne[1] != T || relp->nb[0] != sizeof(int32_t) || mm->ne[0] != Ep || mm->ne[1] != H || mm->ne[2] != T ||
+        cpy->ne[0] != NK || cpy->ne[2] != H || cpy->ne[1]*cpy->ne[3] != T || !ggml_is_contiguous(cpy) ||
+        !ggml_are_same_shape(add, cpy) || mask->ne[0] != NK || mask->nb[0] != sizeof(float) ||
+        (mask->ne[1] != 1 && mask->ne[1] != cpy->ne[1]) || mask->ne[2] != 1 || (mask->ne[3] != 1 && mask->ne[3] != cpy->ne[3])) {
+        return false;
+    }
+    // the permutes are the ones inkling2 builds: (1,0,2,3) on the table, (2,0,1,3) on the gathered rows
+    if (cont1->ne[0] != H || cont1->ne[1] != Ep || gr->ne[0] != H || gr->ne[1] != NK || cont2->ne[0] != NK ||
+        cont2->ne[2] != H) {
+        return false;
+    }
+
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        const ggml_tensor * ins[] = { bias, R, sinks, relp, mask };
+        for (const ggml_tensor * t : ins) {
+            if (overlap(cpy, root(t))) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1137,6 +1241,8 @@ static const std::vector<ggml_op> ops_ctrl_mix      = { GGML_OP_UNARY, GGML_OP_M
 static const std::vector<ggml_op> ops_ctrl_mix_nov  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_sconv = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
                                                 GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT,
+                                                 GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                                 GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
@@ -1191,6 +1297,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_RELPOS, ops_relpos, {}, true, ggml_metal_fusion_check_relpos },
     { GGML_METAL_FUSION_SCONV, ops_sconv, {}, true,  ggml_metal_fusion_check_sconv },
     { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix,     {}, true, ggml_metal_fusion_check_ctrl_mix },
     { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix_nov, {}, true, ggml_metal_fusion_check_ctrl_mix },
@@ -1637,6 +1744,11 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
         int len = 1;
         const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
+            break;
+        }
+        // the packed span is capped at GGML_METAL_FUSION_MAX raw nodes (views included): do not chain a pattern that
+        // would be cut by the cap, or its tail is packed apart and the reorder can split the pattern
+        if (i_f > 0 && idxs[i_f + len - 1] - idx + 1 > GGML_METAL_FUSION_MAX) {
             break;
         }
 

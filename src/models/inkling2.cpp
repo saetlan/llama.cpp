@@ -421,6 +421,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_kv     = rel_pos->ne[0];
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        ggml_build_forward_expand(gf, sinks);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         ggml_tensor * rel_bias = pad_cache[layer.attn_rel_bias];

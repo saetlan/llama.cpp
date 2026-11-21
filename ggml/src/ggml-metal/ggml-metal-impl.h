@@ -763,6 +763,23 @@ typedef struct {
 } ggml_metal_kargs_sconv;
 
 typedef struct {
+    int32_t  NR;    // relative features
+    int32_t  H;
+    int32_t  NK;    // kv cells
+    int32_t  Ts;    // tokens per stream
+    int32_t  S;     // streams
+    int32_t  mne1;  // mask broadcast extents (1 or full)
+    int32_t  mne3;
+    uint64_t nbb1;  // bias row stride
+    uint64_t nbR1;  // R strides (head, token)
+    uint64_t nbR2;
+    uint64_t nbs1;  // sinks token stride
+    uint64_t nbp1;  // rel_pos token stride
+    uint64_t nbm1;  // mask strides
+    uint64_t nbm3;
+} ggml_metal_kargs_relpos;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

@@ -4668,6 +4668,44 @@ struct test_ctrl_mix_fuse : public test_case {
     }
 };
 
+struct test_relpos_fuse : public test_case {
+    const int64_t NK, T, H, Ep;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "RELPOS_FUSE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; } // f16 output
+    std::string vars() override { return VARS_TO_STR4(NK, T, H, Ep); }
+    test_relpos_fuse(int64_t NK = 1280, int64_t T = 1, int64_t H = 24, int64_t Ep = 1025) : NK(NK), T(T), H(H), Ep(Ep) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * bias  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, Ep);       ggml_set_name(bias, "bias");
+        ggml_tensor * R     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, H, T);     ggml_set_name(R, "R");
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);         ggml_set_name(sinks, "sinks");
+        ggml_tensor * relp  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, NK, T);        ggml_set_name(relp, "rel_pos");
+        ggml_tensor * mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, NK, T, 1, 1);  ggml_set_name(mask, "mask");
+        ggml_tensor * table = ggml_mul_mat(ctx, bias, R);
+        table = ggml_sub(ctx, table, ggml_reshape_3d(ctx, sinks, 1, H, T));
+        table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));
+        ggml_tensor * kq_b = ggml_get_rows(ctx, table, relp);
+        kq_b = ggml_reshape_4d(ctx, kq_b, H, NK, T, 1);
+        kq_b = ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3));
+        ggml_tensor * out = ggml_cast(ctx, ggml_add(ctx, kq_b, mask), GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(123);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> d(0, (int32_t) Ep - 1);
+                for (auto & x : v) { x = d(rng); }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
 struct test_clip_rows_fuse : public test_case {
     const std::array<int64_t, 3> ne; // [n_embd_head, n_head, n_tokens]
     const bool scaled;
@@ -10861,7 +10899,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_situ_fuse({1152, 8, 7})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 512})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 333}));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 3}, true));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 8, 3}, false));
-        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
+        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_relpos_fuse(1280, 1)); test_cases.emplace_back(new test_relpos_fuse(4352, 1)); test_cases.emplace_back(new test_relpos_fuse(1536, 5)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two
