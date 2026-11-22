@@ -347,7 +347,10 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * gain   = ggml_tanh(ctx0, gain_pre);
     ggml_tensor * forget = ggml_tanh(ctx0, forget_pre);
 
-    return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    ggml_tensor * out = ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    // hill-climb: right after the projections, so the packed matvec and the blend are adjacent (Metal GF_CTRL fusion)
+    ggml_build_forward_expand(gf, out);
+    return out;
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {

@@ -3148,6 +3148,107 @@ kernel void kernel_mul_mv_mxfp4_f32(
 
 // NVFP4: blocks of 64 values = 4 sub-blocks of 16 with a UE4M3 scale each, 36 bytes (word aligned).
 // 4 threads per block, one sub-block each (8 quant bytes = two words); 8 blocks per simdgroup step
+// rows c (gain) and E + c (forget) of the packed matvec as kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2>
+// computes each row with NSG = 1 (same lanes, same order, same two-level simd_sum), then kernel_ctrl_mix_f32's blend
+// on channel c; one simdgroup (threadgroup) per channel
+kernel void kernel_gf_ctrl_f32(
+        constant ggml_metal_kargs_gf_ctrl & args,
+        device const char * src0,
+        device const char * x,
+        device const char * c,
+        device const char * m,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr short NSG = 1;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int ch = tgpig.x;
+    const int nb = args.ne00/NB;
+
+    device const float4 * ax4[NR0];
+    ax4[0] = (device const float4 *) (src0 + (uint64_t) ch*args.nb01);            // gain row
+    ax4[1] = (device const float4 *) (src0 + (uint64_t) (args.E + ch)*args.nb01); // forget row
+
+    device const float4 * y4 = (device const float4 *) x;
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    float4 yl4[NF4];
+
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const float4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+            }
+
+            sumf[row] += sumq;
+        }
+
+        yb4 += NSG*NF*NW/4;
+    }
+
+    // helper_mv_reduce_and_write<2>, keeping the totals
+    threadgroup float * shmem_f32[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *) shmem + NW*row;
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float tot[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        tot[row] = simd_sum(shmem_f32[row][tiisg]);
+    }
+
+    if (tiisg == 0 && sgitg == 0) {
+#pragma clang fp contract(off)
+        const float gv = tot[0];
+        const float fv = tot[1];
+        const float cv = ((device const float *) c)[ch];
+        const float mv = ((device const float *) m)[ch];
+
+        // kernel_ctrl_mix_f32
+        const float t1 = precise::tanh(fv) * cv;
+        const float s  = cv - t1;
+        const float t2 = precise::tanh(gv) * mv;
+
+        ((device float *) dst)[ch] = s + t2;
+    }
+}
+
 // kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2> with NSG = 4 and the vector [a; b] read from its two parts:
 // the 16-float lane chunks start at multiples of 16, so with Na % 16 == 0 each chunk lies in a or in b
 kernel void kernel_cat_mv_f32(

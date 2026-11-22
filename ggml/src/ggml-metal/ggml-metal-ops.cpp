@@ -2814,6 +2814,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_relpos_fused(ctx, idx);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GF_CTRL && getenv("GGML_METAL_GF_CTRL_DISABLE") == nullptr) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_gf_ctrl_fused(ctx, idx);
+        }
     }
 
     ggml_tensor * op = ctx->node(idx);
@@ -5600,6 +5604,49 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, (args.E + nth - 1)/nth, mm2->ne[1], 1, nth, 1, 1);
 
     return 4;
+}
+
+// packed gain|forget matvec + control blend at one token; idx is the MUL_MAT (7 nodes)
+int ggml_metal_op_gf_ctrl_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mm = ctx->node(idx + 0);
+    const ggml_tensor * sb = ctx->node(idx + 3);
+    const ggml_tensor * m2 = ctx->node(idx + 5);
+    ggml_tensor       * ad = ctx->node(idx + 6);
+
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    const ggml_tensor * c = sb->src[0];
+    const ggml_tensor * m = m2->src[1];
+
+    for (int i = 0; i < 7; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_gf_ctrl args = {};
+    args.ne00 = (int32_t) w->ne[0];
+    args.E    = (int32_t) ad->ne[0];
+    args.nb01 = w->nb[1];
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_gf_ctrl_f32");
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(c),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ad), 5);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float)*2, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.E, 1, 1, 32, 1, 1);
+
+    return 7;
 }
 
 // control input: concat + F32 matvec at one token without the concat; idx is the CONCAT

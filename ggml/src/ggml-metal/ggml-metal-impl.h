@@ -820,6 +820,12 @@ typedef struct {
 } ggml_metal_kargs_cat_mv;
 
 typedef struct {
+    int32_t  ne00;  // low-rank length (32..128)
+    int32_t  E;     // channels
+    uint64_t nb01;  // weight row stride
+} ggml_metal_kargs_gf_ctrl;
+
+typedef struct {
     int32_t  NR;    // relative features
     int32_t  H;
     int32_t  NK;    // kv cells

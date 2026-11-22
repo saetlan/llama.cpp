@@ -1221,6 +1221,76 @@ static bool ggml_metal_fusion_check_cat_mv(
     return true;
 }
 
+// y = Wgf^T x (rows [gain | forget]) at one token, then out = cur - tanh(forget)*cur + tanh(gain)*message; the matvec is
+// on the kernel_mul_mv_f32_f32_4 path with nsg 1 (ne00 <= 128), replicated per row
+static bool ggml_metal_fusion_check_gf_ctrl(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * mm = nodes[0];
+    const ggml_tensor * tf = nodes[1];
+    const ggml_tensor * m1 = nodes[2];
+    const ggml_tensor * sb = nodes[3];
+    const ggml_tensor * tg = nodes[4];
+    const ggml_tensor * m2 = nodes[5];
+    const ggml_tensor * ad = nodes[6];
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    const ggml_tensor * fv = tf->src[0];
+    const ggml_tensor * gv = tg->src[0];
+    const ggml_tensor * x  = mm->src[1];
+    const ggml_tensor * w  = mm->src[0];
+    const int64_t E = ad->ne[0];
+    if (!fv || !gv || fv->view_src != mm || gv->view_src != mm || gv->view_offs != 0 || fv->view_offs != (size_t) E*sizeof(float)) {
+        return false;
+    }
+    const ggml_tensor * c = sb->src[0];
+    const bool wired = m1->src[0] == tf && m1->src[1] == c && sb->src[1] == m1 && m2->src[0] == tg &&
+                       ((ad->src[0] == sb && ad->src[1] == m2) || (ad->src[0] == m2 && ad->src[1] == sb));
+    if (!wired) {
+        return false;
+    }
+    const ggml_tensor * m = m2->src[1];
+    if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || ad->type != GGML_TYPE_F32 ||
+        c->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 ||
+        w->ne[0] < 32 || w->ne[0] > 128 || w->ne[0] % 32 != 0 || w->ne[1] != 2*E || w->ne[2] != 1 || w->nb[0] != sizeof(float) ||
+        w->nb[1] % 16 != 0 || ggml_nelements(x) != w->ne[0] || x->nb[0] != sizeof(float) || mm->ne[1] != 1 ||
+        ad->ne[1] != 1 || ad->ne[2] != 1 || !ggml_is_contiguous(ad) || c->ne[0] != E || m->ne[0] != E ||
+        c->nb[0] != sizeof(float) || m->nb[0] != sizeof(float) || c->ne[1] != 1 || m->ne[1] != 1) {
+        return false;
+    }
+    for (int i = 0; i < 6; ++i) { // only the ADD leaves the group (the matvec output feeds the two TANH through views)
+        if (i == 0) {
+            continue;
+        }
+        if (ggml_node_get_use_count(gf, node_idxs[idx + i]) != 1) {
+            return false;
+        }
+    }
+    if (mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(ad, root(c)) || overlap(ad, root(m)) || overlap(ad, root(x))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1779,6 +1849,10 @@ static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAP
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_cat_mv          = { GGML_OP_CONCAT, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_gf_ctrl         = { GGML_OP_MUL_MAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                                                          GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_gf_ctrl_nov     = { GGML_OP_MUL_MAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                                                          GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_norm_concat     = { GGML_OP_RMS_NORM, GGML_OP_CONCAT };
 static const std::vector<ggml_op> ops_norm_concat_r   = { GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_CONCAT };
 static const std::vector<ggml_op> ops_mv_id_scale     = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_MUL };
@@ -1854,6 +1928,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
     { GGML_METAL_FUSION_CAT_MV,      ops_cat_mv,        {}, true, ggml_metal_fusion_check_cat_mv },
+    { GGML_METAL_FUSION_GF_CTRL,     ops_gf_ctrl,       {}, true, ggml_metal_fusion_check_gf_ctrl },
+    { GGML_METAL_FUSION_GF_CTRL,     ops_gf_ctrl_nov,   {}, true, ggml_metal_fusion_check_gf_ctrl },
     { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat,   {}, true, ggml_metal_fusion_check_norm_concat },
     { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat_r, {}, true, ggml_metal_fusion_check_norm_concat },
     { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale,     {}, true, ggml_metal_fusion_check_mv_id_scale },
