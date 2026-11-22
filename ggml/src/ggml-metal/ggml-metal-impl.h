@@ -817,6 +817,16 @@ typedef struct {
 } ggml_metal_kargs_mix_tail1;
 
 typedef struct {
+    int32_t  E;
+    int32_t  nr;    // states rows (<= 8)
+    uint64_t nbs1;  // states row stride
+    uint64_t nbs2;  // per token (grid z): states, query, output
+    uint64_t nbq2;
+    uint64_t nbd2;
+    float    scale; // softmax scale
+} ggml_metal_kargs_mix_tail1t;
+
+typedef struct {
     int32_t  ne00;  // vector length (Na + Nb)
     int32_t  ne01;  // output rows
     int32_t  Na;    // elements taken from a

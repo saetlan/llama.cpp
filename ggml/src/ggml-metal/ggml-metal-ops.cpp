@@ -5817,6 +5817,51 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // a batch of tokens with one query each: scores, softmax and second product in one kernel (token = grid z)
+    {
+        const ggml_tensor * qy = mm1->src[1];
+        const int64_t E = states->ne[0];
+        // small batches only (2-user decode, verify steps): in prompt batches every threadgroup recomputing all the
+        // scores is slower than the separate batched product (pp512 -6%)
+        static const bool    off  = getenv("GGML_METAL_MIX_TAIL1T_DISABLE") != nullptr;
+        static const int64_t maxt = getenv("GGML_METAL_MIX_TAIL1T_MAXT") ? atoll(getenv("GGML_METAL_MIX_TAIL1T_MAXT")) : 8;
+        if (!off && states->ne[2] > 1 && states->ne[2] <= maxt && qy->ne[1] == 1 && qy->ne[2] == states->ne[2] && qy->ne[3] == 1 &&
+            qy->type == GGML_TYPE_F32 && qy->nb[0] == sizeof(float) && qy->nb[2] % 16 == 0 &&
+            states->type == GGML_TYPE_F32 && states->nb[0] == sizeof(float) && states->ne[3] == 1 &&
+            states->nb[1] % 16 == 0 && states->nb[2] % 16 == 0 && E % 32 == 0 && E >= 512 && states->ne[1] <= 8 &&
+            qy->ne[0] == E && mm2->ne[1] == 1 && ggml_is_contiguous(mm2)) {
+            for (int i = 1; i < 4; ++i) {
+                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                    break;
+                }
+            }
+
+            ggml_metal_kargs_mix_tail1t args = {};
+            args.E    = (int32_t) E;
+            args.nr   = (int32_t) states->ne[1];
+            args.nbs1 = states->nb[1];
+            args.nbs2 = states->nb[2];
+            args.nbq2 = qy->nb[2];
+            args.nbd2 = mm2->nb[2];
+            memcpy(&args.scale, (const float *) sm->op_params + 0, sizeof(float));
+
+            auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mix_tail1_t_f32");
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(states), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(qy),     2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(qy),     3);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm2),    4);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, (4*32 + 16)*sizeof(float), 0);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (E + 255)/256, 1, states->ne[2], 256, 1, 1);
+
+            return 4;
+        }
+    }
+
     // the scores product, with the usual dependency check
     if (!ggml_metal_op_concurrency_check(ctx, mm1)) {
         ggml_metal_op_concurrency_reset(ctx);
