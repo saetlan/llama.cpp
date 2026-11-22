@@ -16,7 +16,7 @@ template<
     typename SA, typename SA_4x4, typename SA_8x8,
     typename SB, typename SB_2x4, typename SB_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
-    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4, short BX = N_MM_BLOCK_X>
 kernel void kernel_mul_mm(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * srcA,
@@ -42,7 +42,8 @@ kernel void kernel_mul_mm(
     const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
 
     // Tile dimensions
-    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    // hill-climb: BX < N_MM_BLOCK_X gives narrower token tiles (more threadgroups) for products with few output rows
+    constexpr int NRB = SZ_SIMDGROUP * BX * N_MM_SIMD_GROUP_X;
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
 
     // Tile offsets in output matrix
@@ -74,7 +75,7 @@ kernel void kernel_mul_mm(
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     // Accumulate partial results over K dimension
     for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
@@ -152,7 +153,7 @@ template<
     typename S0, typename S0_4x4, typename S0_8x8,
     typename S1, typename S1_2x4, typename S1_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
-    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4, short BX = N_MM_BLOCK_X>
 kernel void kernel_mul_mm(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * src0,
@@ -922,6 +923,12 @@ template [[host_name("kernel_mul_mm_q4_1_f32")]]    kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_q5_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_0,    2,     dequantize_q5_0,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q5_1_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_1,    2,     dequantize_q5_1,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  float, float2x4>;
+#if defined(GGML_METAL_HAS_TENSOR)
+// hill-climb: narrow token tiles (BX = 1) for products with few output rows
+template [[host_name("kernel_mul_mm_f32_f32_bx1")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4, 1>;
+template [[host_name("kernel_mul_mm_f16_f32_bx1")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4, 1>;
+template [[host_name("kernel_mul_mm_q8_0_f32_bx1")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  float, float2x4, 1>;
+#endif
 template [[host_name("kernel_mul_mm_mxfp4_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_mxfp4,   2,     dequantize_mxfp4,   float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q2_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q3_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q3_K,    QK_NL, dequantize_q3_K,    float,  float4x4,  float, float2x4>;
