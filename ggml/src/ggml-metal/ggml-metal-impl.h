@@ -773,6 +773,10 @@ typedef struct {
     uint64_t nbp1;  // past channel stride
     uint64_t nbw1;  // weight row
     uint64_t nbd1;  // projection: head stride (lag stride is 4 bytes)
+    uint64_t nbd2;  // projection: token stride
+    uint64_t nbp2;  // past: sequence stride
+    uint64_t nbs1;  // state: sequence stride
+    int32_t  T;     // tokens per sequence
     float    sc;
     float    bi;
 } ggml_metal_kargs_sconv_dyn;

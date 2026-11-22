@@ -796,9 +796,13 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             struct ggml_tensor * nd = ctx->opprof ? ggml_metal_op_node_at(ctx_op, idx) : NULL;
+            struct ggml_tensor * n0 = ggml_metal_op_node_at(ctx_op, idx);
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
                 break;
+            }
+            if (ggml_metal_op_twice_match(n0, res)) {
+                ggml_metal_op_encode(ctx_op, idx);
             }
 
             if (ctx->opprof) {

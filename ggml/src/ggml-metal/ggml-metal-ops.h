@@ -31,6 +31,7 @@ void                 ggml_metal_op_swap_cmd_buf(ggml_metal_op_t ctx, ggml_metal_
 struct ggml_tensor * ggml_metal_op_node_at     (ggml_metal_op_t ctx, int i);
 void                 ggml_metal_opprof_add     (const struct ggml_tensor * t, int n_nodes, double seconds);
 void                 ggml_metal_opprof_dump    (int n_nodes_graph);
+bool                 ggml_metal_op_twice_match (const struct ggml_tensor * t, int n_nodes);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 

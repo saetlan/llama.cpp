@@ -944,8 +944,11 @@ static bool ggml_metal_fusion_check_sconv_dyn(
         return false;
     }
     const int64_t C = cat->ne[1], S = cat->ne[2], T = xt->ne[0];
-    if (T != 1 || S != 1) {
-        return false; // decode only
+    // one thread per (channel, sequence) loops over the tokens; GGML_METAL_SCONV_DYN_MAXT caps T (default: decode and
+    // small batches only, where the unfused chain is many tiny dispatches)
+    static const int64_t max_t = getenv("GGML_METAL_SCONV_DYN_MAXT") ? atoll(getenv("GGML_METAL_SCONV_DYN_MAXT")) : 64;
+    if (T < 1 || S < 1 || T > max_t) {
+        return false;
     }
 
     // the tap chain: per lag, a CONT of a transposed window view of x, a MUL by a tap view of the projection, an ADD

@@ -264,6 +264,20 @@ void ggml_metal_opprof_add(const ggml_tensor * t, int n_nodes, double seconds) {
     e.n   += 1;
 }
 
+// GGML_METAL_OP_TWICE=<substring>: op groups whose profiler key ("OP xN name#") contains it are encoded twice
+// (profiling only: the end-to-end slowdown is the in-pipeline cost of that group; outputs may change)
+bool ggml_metal_op_twice_match(const ggml_tensor * t, int n_nodes) {
+    static const char * pat = getenv("GGML_METAL_OP_TWICE");
+    if (pat == nullptr || t == nullptr) {
+        return false;
+    }
+    std::string nm;
+    for (const char * c = t->name; *c; ++c) { if (*c >= '0' && *c <= '9') { if (nm.empty() || nm.back() != '#') nm += '#'; } else nm += *c; }
+    char key[512];
+    snprintf(key, sizeof(key), "%s x%d %s [%lld]", ggml_op_desc(t), n_nodes, nm.c_str(), (long long) t->ne[0]);
+    return strstr(key, pat) != nullptr;
+}
+
 void ggml_metal_opprof_dump(int n_nodes_graph) {
     std::lock_guard<std::mutex> lk(g_opprof_mtx);
     std::vector<std::pair<std::string, opprof_entry>> v(g_opprof.begin(), g_opprof.end());
@@ -6215,6 +6229,10 @@ int ggml_metal_op_sconv_dyn_fused(ggml_metal_op_t ctx, int idx, int n) {
     args.nbp1 = past->nb[1];
     args.nbw1 = w->nb[1];
     args.nbd1 = dyn->nb[1];
+    args.nbd2 = dyn->nb[2];
+    args.nbp2 = past->nb[2];
+    args.nbs1 = cell->nb[1];
+    args.T    = (int32_t) (cur->ne[1]/cat->ne[2]);
     args.sc   = ggml_get_op_params_f32(scl, 0);
     args.bi   = ggml_get_op_params_f32(scl, 1);
 
@@ -6228,7 +6246,7 @@ int ggml_metal_op_sconv_dyn_fused(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dyn),  6);
 
     const int nth = 256;
-    ggml_metal_encoder_dispatch_threadgroups(enc, (args.C + nth - 1)/nth, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.C + nth - 1)/nth, (int) cat->ne[2], 1, nth, 1, 1);
 
     return n;
 }
