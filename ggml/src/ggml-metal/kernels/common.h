@@ -68,6 +68,11 @@ static inline float e8m0_to_fp32(uint8_t x) {
     return as_type<float>(bits);
 }
 
+// the 7 bits read as fp16 give the scale / 256; unlike ggml_ue4m3_to_fp32 there is no 0.5 factor, as kvalues_mxfp4_f is not doubled
+static inline float ue4m3_to_fp32(uint8_t x) {
+    return x == 0x7F ? 0.0f : 256.0f*float(as_type<half>(ushort((x & 0x7F) << 7)));
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }
