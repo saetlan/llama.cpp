@@ -827,6 +827,10 @@ typedef struct {
     int32_t  ne00;  // low-rank length (32..128)
     int32_t  E;     // channels
     uint64_t nb01;  // weight row stride
+    uint64_t nbx1;  // per token (grid y): low-rank input, c, m, output
+    uint64_t nbc1;
+    uint64_t nbm1;
+    uint64_t nbd1;
 } ggml_metal_kargs_gf_ctrl;
 
 typedef struct {

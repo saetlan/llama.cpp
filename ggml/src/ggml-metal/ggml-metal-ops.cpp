@@ -5930,6 +5930,10 @@ int ggml_metal_op_gf_ctrl_fused(ggml_metal_op_t ctx, int idx) {
     args.ne00 = (int32_t) w->ne[0];
     args.E    = (int32_t) ad->ne[0];
     args.nb01 = w->nb[1];
+    args.nbx1 = x->nb[1];
+    args.nbc1 = c->nb[1];
+    args.nbm1 = m->nb[1];
+    args.nbd1 = ad->nb[1];
 
     auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_gf_ctrl_f32");
 
@@ -5942,7 +5946,7 @@ int ggml_metal_op_gf_ctrl_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ad), 5);
     ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float)*2, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, args.E, 1, 1, 32, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.E, (int) ad->ne[1], 1, 32, 1, 1);
 
     return 7;
 }

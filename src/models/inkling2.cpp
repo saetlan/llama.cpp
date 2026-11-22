@@ -337,11 +337,12 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     // evaluate both projections before the blend, so its element-wise ops sit together (Metal fuses them)
     ggml_tensor * gain_pre   = nullptr;
     ggml_tensor * forget_pre = nullptr;
-    if (n_tokens == 1 && loop.ctrl_gf[ctrl]) {
-        // one token: gain and forget from one matvec over the packed [gain | forget] rows
+    if (n_tokens <= 5 && loop.ctrl_gf[ctrl]) {
+        // up to 5 tokens (Metal takes the one-column-per-threadgroup matvec, rows computed independently): gain and
+        // forget from one matvec over the packed [gain | forget] rows, which Metal fuses with the blend (GF_CTRL)
         ggml_tensor * y = build_lora_mm(loop.ctrl_gf[ctrl], gate);
-        gain_pre   = ggml_view_2d(ctx0, y, n_embd, 1, y->nb[1], 0);
-        forget_pre = ggml_view_2d(ctx0, y, n_embd, 1, y->nb[1], n_embd*sizeof(float));
+        gain_pre   = ggml_view_2d(ctx0, y, n_embd, n_tokens, y->nb[1], 0);
+        forget_pre = ggml_view_2d(ctx0, y, n_embd, n_tokens, y->nb[1], n_embd*sizeof(float));
     } else {
         gain_pre   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
         forget_pre = build_lora_mm(loop.ctrl_forget[ctrl], gate);

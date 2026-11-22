@@ -3233,6 +3233,11 @@ kernel void kernel_gf_ctrl_f32(
     constexpr short NF4 = NF/4;
 
     const int ch = tgpig.x;
+    // token = grid y: the separate matvec computes each src1 column in its own threadgroup the same way
+    x   += tgpig.y*args.nbx1;
+    c   += tgpig.y*args.nbc1;
+    m   += tgpig.y*args.nbm1;
+    dst += tgpig.y*args.nbd1;
     const int nb = args.ne00/NB;
 
     device const float4 * ax4[NR0];

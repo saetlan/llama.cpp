@@ -1354,9 +1354,17 @@ static bool ggml_metal_fusion_check_gf_ctrl(
     if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || ad->type != GGML_TYPE_F32 ||
         c->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 ||
         w->ne[0] < 32 || w->ne[0] > 128 || w->ne[0] % 32 != 0 || w->ne[1] != 2*E || w->ne[2] != 1 || w->nb[0] != sizeof(float) ||
-        w->nb[1] % 16 != 0 || ggml_nelements(x) != w->ne[0] || x->nb[0] != sizeof(float) || mm->ne[1] != 1 ||
-        ad->ne[1] != 1 || ad->ne[2] != 1 || !ggml_is_contiguous(ad) || c->ne[0] != E || m->ne[0] != E ||
-        c->nb[0] != sizeof(float) || m->nb[0] != sizeof(float) || c->ne[1] != 1 || m->ne[1] != 1) {
+        w->nb[1] % 16 != 0 || x->ne[0] != w->ne[0] || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+        ad->ne[2] != 1 || !ggml_is_contiguous(ad) || c->ne[0] != E || m->ne[0] != E ||
+        c->nb[0] != sizeof(float) || m->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // tokens: one per threadgroup row, as long as the separate product would also take the plain one-column-per-
+    // threadgroup matvec (not the small-batch mv_ext, few-row MMA or matrix paths)
+    static const bool t1_only = getenv("GGML_METAL_GF_CTRL_T1") != nullptr;
+    const int64_t T = mm->ne[1];
+    if (T < 1 || T > 5 || x->ne[1] != T || ad->ne[1] != T || c->ne[1] != T || m->ne[1] != T || mm->ne[2] != 1 ||
+        (T > 1 && (w->ne[0] % 128 == 0 || ggml_metal_op_mul_mat_use_mma(mm) || t1_only))) {
         return false;
     }
     for (int i = 0; i < 6; ++i) { // only the ADD leaves the group (the matvec output feeds the two TANH through views)
