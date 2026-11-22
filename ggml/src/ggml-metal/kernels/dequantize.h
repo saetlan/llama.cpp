@@ -363,6 +363,39 @@ void dequantize_mxfp4(device const block_mxfp4 * xb, short il, thread type4x4 & 
     reg = (type4x4) reg_f;
 }
 
+// UE4M3 scale: the 7 bits placed in the fp16 exponent/mantissa give the value * 2^-8 (e=0 lands on the fp16
+// subnormals); 0x7F (NaN) decodes as 0, as on the CPU
+static inline float nvfp4_ue4m3_x256(uint8_t x) {
+    return x == 0x7F ? 0.0f : float(as_type<half>(ushort((x & 0x7F) << 7)));
+}
+
+// E2M1 value of the low nibble of n, times 2^-14 (fp16 exponent/mantissa trick; e=0 gives the 0.5 subnormal)
+static inline half nvfp4_e2m1_x16384(uint32_t n) {
+    const half c = as_type<half>(ushort((n & 7) << 9));
+    return (n & 8) ? -c : c;
+}
+
+// NVFP4: 64 values in 4 sub-blocks of 16, one UE4M3 scale each; il (0..3) picks the sub-block.
+// in a sub-block, value j < 8 is the low nibble of byte j, value j >= 8 the high nibble of byte j-8
+template <typename type4x4>
+void dequantize_nvfp4(device const block_nvfp4 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q = xb->qs + 8*il;
+
+    const float d = nvfp4_ue4m3_x256(xb->d[il]) * 4194304.0f; // 2^8 * 2^14
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            const int k = 4*i + j;
+            const uint8_t b = q[k & 7];
+            reg_f[i][j] = d * float(nvfp4_e2m1_x16384(k < 8 ? b : (b >> 4)));
+        }
+    }
+
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4>
 void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 & reg) {
     device const uint8_t * q2 = (device const uint8_t *)xb->qs;
