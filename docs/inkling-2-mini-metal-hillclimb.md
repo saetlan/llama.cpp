@@ -8,37 +8,69 @@ The model is a looped MoE. Its 24 layers run as 48 passes, with 128 routed exper
 relative-position attention bias. In stock llama.cpp that means many small kernels per token and a large attention
 mask built on every full-attention layer. Most of the work below goes after those two costs.
 
-The method: measure, change one thing, A/B against controls on both sides, keep it or reject it, and log why. The
-work was AI-assisted (Claude Code), and every change was measured on this machine.
+The method follows [0xSero](https://github.com/0xSero)'s
+[inference-optimisation agent skill](https://github.com/sybil-solutions/inference-optimisation-skill):
+
+- compute the theoretical ceiling first;
+- change one thing at a time;
+- A/B every change against controls run before and after it;
+- keep or reject it, and log why;
+- put the winner through long-context and concurrency checks.
+
+The work was AI-assisted (Claude Code), and every change was measured on this machine.
 
 ## Results
 
-Same session, interleaved runs, medians (llama-server, 131k context, 2 slots, flash attention on):
+One session on 23 Nov 2026, with the three setups run in the order A B C C B A. Settings: llama-server, 131k
+context, 2 slots, flash attention on; medians of 6 decode samples. Each cell is pass 1 / pass 2:
 
-| | stock `418fe97` + Q8_0 | day 1, kernels only, + Q8_0 | this branch + NVFP4 experts |
+| | stock `418fe97` + Q8_0 | this branch, exact (default) | this branch, fast (opt-in) |
 |---|---|---|---|
-| decode, 1 user | 29.2 t/s | 39.1 | **49.2** (+69%) |
-| decode, 2 users (total) | 40.9 | 50.1 | **64.0** (+56%) |
-| prefill, ~4k tokens | 387 t/s | 562 | **863** (+123%) |
-| prefill, ~16k tokens | 312 t/s | 459 | **830** (+166%) |
+| decode, 1 user | 28.4 / 28.6 t/s | 45.8 / **48.2** | 48.0 / 48.3 |
+| decode, 2 users (total) | 39.4 / 40.1 | 60.6 / **66.7** | 60.5 / 66.2 |
+| prefill, 3.3k-token prompt | 372 / 383 t/s | 900 / **1041** | 997 / 1039 |
+| prefill, 12.9k-token prompt | 303 / 308 t/s | 953 / **977** | 990 / 1010 |
 
-The model's outputs did not change in any of the later work:
+On the second pass the exact build against stock gives:
 
-- prefill went up about 25% more (llama-bench pp512: 929 → 1183);
-- 2-user decode went up about 5% (67.2 t/s total);
-- 1-user decode stayed the same.
+- decode +68% (1 user) and +67% (2 users);
+- prefill ×2.7 at 3.3k tokens and ×3.2 at 12.9k tokens.
+
+The first pass of the branch builds ran while the machine was busier, so the decode samples drifted down during
+that run.
+
+Other measurements of the exact build:
+
+- llama-bench pp512 is 1183 t/s.
+- A 119k-token needle prompt prefills at 544 t/s, against 174 t/s for the day-1 build.
 
 These numbers don't include speculative decoding. With `--spec-type ngram-mod` (lossless), file edits and rewrites
 run at 78–137 t/s.
 
-The model file in the last column is the ggml-org Q8_0 with the routed experts of layers 0–19 replaced by the
-released NVFP4 tensors, taken unchanged from Unsloth's UD-Q8_K_XL. Layers 20–23 keep Q8_0, because their
-originals are MXFP8. That file needs the NVFP4 `MUL_MAT_ID` kernels from this branch. The plain Q8_0 also works.
+Both branch columns use the ggml-org Q8_0 with the routed experts of layers 0–19 replaced by the released NVFP4
+tensors, taken unchanged from Unsloth's UD-Q8_K_XL. Layers 20–23 keep Q8_0, because their originals are MXFP8.
+That file needs the NVFP4 `MUL_MAT_ID` kernels from this branch. The plain Q8_0 also works.
+
+### Where the gains came from
+
+Each step was measured against the build before it, in the same session:
+
+| Step | What changed | Effect |
+|---|---|---|
+| 1. Day 1, kernels only, Q8_0 | Graph dedup across loop passes, 12 Metal fusions, packed projections, wider reorder | decode 29.2 → 39.1 t/s; prefill 387 → 562 (4k), 312 → 459 (16k) |
+| 2. NVFP4 experts | Released NVFP4 expert tensors, Metal NVFP4 `MUL_MAT_ID`, rel-pos mask from a bias table, one-token fusions | decode → 49.2; 2 users → 64.0; prefill → 863 (4k), 830 (16k) |
+| 3. Prompt batches | Depth-mix tail for token batches, faster rel-pos mask kernel | prefill +11% (4k), +15% (16k); 2 users +3%; llama-bench pp512 929 → 1112 |
+| 4. Two users | Fusions also fire for 2 sequences and for small batches | 2 users +2.8% (65.4 → 67.2) |
+| 5. Short conv | Removed a 64-bit index division per thread in the prompt-batch short conv | prefill +3.3% (1006 → 1039 at 4k) |
+| 6. Narrow tiles | 32-token tiles for tensor-API matmuls with few output rows | llama-bench pp512 1162 → 1183 (+1.8%) |
+
+Steps 3–6 keep the model's outputs bit-identical. Single-user decode stayed flat after step 2: it was already near
+its limit (see Limits).
 
 ## Exactness
 
-The most recent changes keep results bit-identical to the build before them. Each one was checked against the
-previous build with all of these:
+The changes from step 3 onwards keep results bit-identical to the build before them. Each one was checked with all
+of these:
 
 - a wikitext KLD run identical to every printed digit;
 - greedy panels with top-5 logprobs;
@@ -50,10 +82,12 @@ Some day-1 fusions change rounding. Against the Q8_0 logits on wikitext, KLD is 
 0.0017 on the decode path. That is the floating-point noise floor for this model, which turns last-bit rounding
 differences into visible greedy divergence.
 
-Two opt-ins that change rounding stay off by default:
+The fast column is opt-in and changes rounding: `-ub 1024 --cache-ram 4096` plus `GGML_METAL_MMID_MIN_T=6`.
 
-- `GGML_METAL_MMID_MIN_T=6` makes 6–31-token batches 12–64% faster;
-- `-ub 1024` adds about 7% prefill at 4k–16k context.
+- KLD against the exact path is 0.0002.
+- Prefill: +3% at 12.9k tokens in the table above, and +7% in llama-bench pp4096.
+- Follow-up prompts of 6–31 tokens run 12–64% faster.
+- GPU peak is 46 GiB instead of 35 GiB.
 
 Qualified: a 119k-token needle found 3/3; two concurrent ~55k-token needles found 6/6; GPU peak 35 GiB; no swap.
 
@@ -91,8 +125,8 @@ Most of these have a `GGML_METAL_<NAME>_DISABLE` switch and a `test-backend-ops`
 **Generic Metal**
 - The graph reorder can move across plain CONCAT, SQR, SQRT, FILL, PAD and SOFT_MAX nodes, with a bounded
   lookahead so time to first token doesn't grow.
-- Tensor-API matmuls with few output rows use 32-token tiles instead of 128 (prefill +1.7%). Set
-  `GGML_METAL_MM_NARROW_DISABLE` to turn it off.
+- Tensor-API matmuls with few output rows use 32-token tiles instead of 128. Set `GGML_METAL_MM_NARROW_DISABLE` to
+  turn it off.
 - Profiling switches:
   - `GGML_METAL_OPPROF=1`: GPU time per op group;
   - `GGML_METAL_OP_TWICE=<pattern>`: encodes matching groups twice, to measure their cost inside the pipeline;
@@ -110,12 +144,16 @@ build/bin/llama-server -m Inkling-2-Mini-Q8_0-nvfp4exp.gguf -a inkling-2-mini \
   --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0
 ```
 
+For the fast setup, add `-ub 1024 --cache-ram 4096` and set `GGML_METAL_MMID_MIN_T=6`.
+
 ## Limits
 
 - Everything was measured on one M5 Pro, with measured memory bandwidth of 297 GB/s. Other Apple GPUs are untested.
   The graph-level changes also affect other backends, but they were not tested there.
 - Single-user decode is close to its practical limit for exact kernels. Each token still runs about 1,750 dependent
   kernels at roughly 4–5 µs each, and the weight kernels already run near bandwidth.
+- The fast setup needs about 11 GiB more GPU memory. With other apps open it caused 140–470 MiB of swap in the run
+  above; the exact build caused none.
 - The relative-position bias inside flash attention (upstream PR 32740 plus a Metal port) lives in a separate local
   branch. It saves about 11 GiB of compute buffer but is slower at prefill than this branch's mask kernel.
 - The DSpark drafter is still 12–40% slower than plain decoding on this machine.
