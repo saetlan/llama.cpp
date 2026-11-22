@@ -4696,8 +4696,20 @@ struct test_relpos_fuse : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> v(ggml_nelements(t));
-                std::uniform_int_distribution<int32_t> d(0, (int32_t) Ep - 1);
-                for (auto & x : v) { x = d(rng); }
+                if (T >= 64) {
+                    // prompt-batch perf: causal distance buckets as the model builds them (band of Ep - 1, then the
+                    // padded zero row), the last T cells being the batch itself
+                    for (int64_t tt = 0; tt < T; ++tt) {
+                        const int64_t pos = NK - T + tt;
+                        for (int64_t kv = 0; kv < NK; ++kv) {
+                            const int64_t dd = pos - kv;
+                            v[tt*NK + kv] = (int32_t) (dd < 0 ? Ep - 1 : std::min<int64_t>(dd, Ep - 1));
+                        }
+                    }
+                } else {
+                    std::uniform_int_distribution<int32_t> d(0, (int32_t) Ep - 1);
+                    for (auto & x : v) { x = d(rng); }
+                }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t, -2.0f, 2.0f);

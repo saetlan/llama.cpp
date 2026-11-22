@@ -1069,7 +1069,9 @@ static bool ggml_metal_fusion_check_mv_id_scale(
     const ggml_tensor * mul = nodes[n - 1];
     const ggml_tensor * ids = mm->src[2];
 
+    static const bool mm_off = getenv("GGML_METAL_MMID_SCALE_DISABLE") != nullptr;
     if (mm->src[0]->type != GGML_TYPE_NVFP4 || mm->src[1]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        (mm_off && ggml_metal_op_mul_mat_id_use_mm(mm, true)) ||
         !ggml_is_contiguous(mm) || mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
         return false;
     }
