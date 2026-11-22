@@ -1,5 +1,10 @@
 # llama.cpp
 
+> **Fork branch `inkling-hc`:** a Metal speed hill climb for Inkling 2 Mini on Apple Silicon (M5 Pro). Compared
+> with stock, decode is +69% and prefill is +123–166%. See
+> [docs/inkling-2-mini-metal-hillclimb.md](docs/inkling-2-mini-metal-hillclimb.md). This branch is not upstream
+> llama.cpp.
+
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
