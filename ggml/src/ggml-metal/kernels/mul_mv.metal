@@ -584,6 +584,69 @@ void kernel_mul_mv_q8_0_f32_impl(
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
+// kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0> with NSG = 4 and its input computed as kernel_gate_mul_f32 does:
+// y[k] = c[k] * (1 / (1 + exp(-g[k])))
+kernel void kernel_gate_mv_q8_0_f32(
+        constant ggml_metal_kargs_gate_mv & args,
+        device const char * src0,
+        device const char * cg,
+        device const char * gg,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = N_R0_Q8_0;
+    constexpr short NSG = 4;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NQ  = 8;
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+
+    device const float * c = (device const float *) cg;
+    device const float * g = (device const float *) gg;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) (src0 + (uint64_t) min(r0 + row, args.ne01 - 1)*args.nb01);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+
+    int yo = ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            const float x = g[yo + i];
+            const float s = 1 / (1 + exp(-x));
+            yl[i] = c[yo + i] * s;
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yo += NSG*NQ*QK8_0;
+    }
+
+    helper_mv_reduce_and_write<NR0>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 [[host_name("kernel_mul_mv_q8_0_f32")]]
 kernel void kernel_mul_mv_q8_0_f32(
         constant ggml_metal_kargs_mul_mv & args,

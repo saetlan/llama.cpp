@@ -1293,6 +1293,46 @@ static bool ggml_metal_fusion_check_gf_ctrl(
     return true;
 }
 
+// y = W^T (c * sigmoid(g)) at one token, W Q8_0 on the kernel_mul_mv_q8_0_f32 path (nsg 4, nr0 2): the gated input is
+// computed per element as kernel_gate_mul_f32 does and fed to an exact replica of the matvec
+static bool ggml_metal_fusion_check_gate_mv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    if (!ggml_metal_fusion_check_gate_mul(fusion, nodes, gf, node_idxs, idx, mode)) {
+        return false;
+    }
+    const ggml_tensor * mul = nodes[1];
+    const ggml_tensor * mm  = nodes[2];
+    const ggml_tensor * w   = mm->src[0];
+    if (mm->src[1] != mul || w->type != GGML_TYPE_Q8_0 || mm->type != GGML_TYPE_F32 || mul->ne[1] != 1 ||
+        mul->ne[2] != 1 || mul->ne[3] != 1 || w->ne[0] != mul->ne[0] || w->ne[0] % 32 != 0 || w->ne[2] != 1 ||
+        w->ne[3] != 1 || mm->ne[1] != 1 || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(gf, node_idxs[idx]) != 1 || ggml_node_get_use_count(gf, node_idxs[idx + 1]) != 1) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(mm, root(mul->src[0])) || overlap(mm, root(nodes[0]->src[0]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1850,6 +1890,7 @@ static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAP
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_gate_mv  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_cat_mv          = { GGML_OP_CONCAT, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gf_ctrl         = { GGML_OP_MUL_MAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
                                                           GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD };
@@ -1928,6 +1969,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_STORE, ops_norm_store, {}, true, ggml_metal_fusion_check_norm_store },
     { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
+    { GGML_METAL_FUSION_GATE_MV,  ops_gate_mv,  {}, true,  ggml_metal_fusion_check_gate_mv  },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
     { GGML_METAL_FUSION_CAT_MV,      ops_cat_mv,        {}, true, ggml_metal_fusion_check_cat_mv },
     { GGML_METAL_FUSION_GF_CTRL,     ops_gf_ctrl,       {}, true, ggml_metal_fusion_check_gf_ctrl },

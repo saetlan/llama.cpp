@@ -826,6 +826,12 @@ typedef struct {
 } ggml_metal_kargs_gf_ctrl;
 
 typedef struct {
+    int32_t  ne00;  // input length (multiple of 32)
+    int32_t  ne01;  // output rows
+    uint64_t nb01;  // weight row stride
+} ggml_metal_kargs_gate_mv;
+
+typedef struct {
     int32_t  NR;    // relative features
     int32_t  H;
     int32_t  NK;    // kv cells

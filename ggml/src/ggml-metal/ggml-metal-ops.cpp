@@ -1045,6 +1045,14 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     if (op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID && ctx->use_fusion()) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GATE_MV && getenv("GGML_METAL_GATE_MV_DISABLE") == nullptr) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_gate_mv_fused(ctx, idx);
+        }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GATE_MV) {
+            // disabled: run the gate alone, the matvec follows as usual
+            return ggml_metal_op_gate_mul_fused(ctx, idx);
+        }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_GATE_MUL) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_gate_mul_fused(ctx, idx);
@@ -5774,6 +5782,43 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, (args.E + nth - 1)/nth, mm2->ne[1], 1, nth, 1, 1);
 
     return 4;
+}
+
+// attention gate + wo matvec at one token; idx is the sigmoid (3 nodes)
+int ggml_metal_op_gate_mv_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * sg  = ctx->node(idx + 0);
+    const ggml_tensor * mul = ctx->node(idx + 1);
+    ggml_tensor       * mm  = ctx->node(idx + 2);
+    const ggml_tensor * w   = mm->src[0];
+
+    for (int i = 0; i < 3; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_gate_mv args = {};
+    args.ne00 = (int32_t) w->ne[0];
+    args.ne01 = (int32_t) w->ne[1];
+    args.nb01 = w->nb[1];
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_gate_mv_q8_0_f32");
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),           1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mul->src[0]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sg->src[0]),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm),          4);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float)*N_R0_Q8_0, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne01 + N_R0_Q8_0 - 1)/N_R0_Q8_0, 1, 1, 32, 4, 1);
+
+    return 3;
 }
 
 // packed gain|forget matvec + control blend at one token; idx is the MUL_MAT (7 nodes)

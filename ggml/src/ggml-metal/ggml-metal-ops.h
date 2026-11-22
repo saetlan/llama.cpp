@@ -106,6 +106,7 @@ int ggml_metal_op_mv_id_scale_fused (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_norm_concat_fused (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_cat_mv_fused      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gf_ctrl_fused     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_gate_mv_fused     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_clip_rows_fused   (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_upscale           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad               (ggml_metal_op_t ctx, int idx);

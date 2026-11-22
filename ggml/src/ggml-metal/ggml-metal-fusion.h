@@ -53,6 +53,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_RELPOS,       // MUL_MAT + SUB + CONT + GET_ROWS + CONT + ADD + CPY (inkling2 rel-pos F16 mask)
     GGML_METAL_FUSION_MIX_TAIL,     // CONT + MUL_MAT + SOFT_MAX + MUL_MAT: scores product, then softmax-weighted sum
     GGML_METAL_FUSION_GATE_MUL,     // UNARY(sigmoid) + MUL
+    GGML_METAL_FUSION_GATE_MV,      // UNARY(sigmoid) + MUL + Q8_0 MUL_MAT at one token: matvec over c*sigmoid(g)
     GGML_METAL_FUSION_GF_CTRL,      // packed gain|forget F32 MUL_MAT + VIEW x2 + control blend (TANH MUL SUB TANH MUL ADD), one token
     GGML_METAL_FUSION_CAT_MV,       // CONCAT(a, b, dim 0) + F32 MUL_MAT at one token (inkling2 control input)
     GGML_METAL_FUSION_NORM_CONCAT,  // RMS_NORM (no weight) + [RESHAPE] + CONCAT(stack, normed, dim 1): both outputs written
