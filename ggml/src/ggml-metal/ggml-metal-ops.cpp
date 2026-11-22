@@ -1,3 +1,6 @@
+#include <string>
+#include <mutex>
+#include <map>
 #include "ggml-metal-ops.h"
 
 #include "ggml.h"
@@ -227,6 +230,52 @@ void ggml_metal_op_free(ggml_metal_op_t ctx) {
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
+}
+
+void ggml_metal_op_swap_cmd_buf(ggml_metal_op_t ctx, ggml_metal_cmd_buf_t cmd_buf) {
+    ggml_metal_encoder_end_encoding(ctx->enc);
+    ggml_metal_encoder_free(ctx->enc);
+    ctx->enc = ggml_metal_encoder_init(cmd_buf, ctx->use_concurrency);
+    if (ctx->mem_ranges) {
+        ggml_mem_ranges_reset(ctx->mem_ranges);
+    }
+}
+
+ggml_tensor * ggml_metal_op_node_at(ggml_metal_op_t ctx, int i) {
+    return ctx->node(i);
+}
+
+namespace {
+struct opprof_entry { double sec = 0.0; int n = 0; };
+std::map<std::string, opprof_entry> g_opprof;
+std::mutex g_opprof_mtx;
+}
+
+void ggml_metal_opprof_add(const ggml_tensor * t, int n_nodes, double seconds) {
+    std::string name = t->name;
+    std::string nm;
+    for (char c : name) { if (c >= '0' && c <= '9') { if (nm.empty() || nm.back() != '#') nm += '#'; } else nm += c; }
+    char key[512];
+    snprintf(key, sizeof(key), "%-14s x%-2d %-28s [%lld,%lld,%lld]", ggml_op_desc(t), n_nodes, nm.c_str(),
+        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2]);
+    std::lock_guard<std::mutex> lk(g_opprof_mtx);
+    auto & e = g_opprof[key];
+    e.sec += seconds;
+    e.n   += 1;
+}
+
+void ggml_metal_opprof_dump(int n_nodes_graph) {
+    std::lock_guard<std::mutex> lk(g_opprof_mtx);
+    std::vector<std::pair<std::string, opprof_entry>> v(g_opprof.begin(), g_opprof.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.sec > b.second.sec; });
+    double tot = 0.0; int cnt = 0;
+    for (auto & x : v) { tot += x.second.sec; cnt += x.second.n; }
+    fprintf(stderr, "opprof: graph of %d nodes: %d op groups, sum of GPU times %.3f ms\n", n_nodes_graph, cnt, tot*1e3);
+    for (auto & x : v) {
+        fprintf(stderr, "opprof: %8.3f ms %5.1f%% %5d x %8.2f us  %s\n", x.second.sec*1e3, 100.0*x.second.sec/tot, x.second.n,
+            1e6*x.second.sec/x.second.n, x.first.c_str());
+    }
+    g_opprof.clear();
 }
 
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
@@ -5768,7 +5817,27 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
     args.nbs1 = states->nb[1];
     args.nbp1 = mm1->nb[1];
     args.nbd1 = mm2->nb[1];
+    args.nbs2 = states->nb[2];
+    args.nbp2 = mm1->nb[2];
+    args.nbd2 = mm2->nb[2];
     memcpy(&args.scale, (const float *) sm->op_params + 0, sizeof(float));
+
+    // a batch of tokens: the softmax replicated exactly in the tail kernel (one-token decode keeps kernel_mix_tail_f32)
+    if (states->ne[2] > 1) {
+        auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mix_tail_t_f32");
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(states), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm1),    2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm1),    3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm2),    4);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 8*sizeof(float), 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (args.E + 255)/256, mm2->ne[1], mm2->ne[2], 256, 1, 1);
+
+        return 4;
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mix_tail_f32");
 
@@ -5779,7 +5848,7 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm2),    3);
 
     const int nth = 256;
-    ggml_metal_encoder_dispatch_threadgroups(enc, (args.E + nth - 1)/nth, mm2->ne[1], 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.E + nth - 1)/nth, mm2->ne[1], mm2->ne[2], nth, 1, 1);
 
     return 4;
 }
@@ -6230,6 +6299,10 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((args.NK + CH - 1)/CH), (args.H + HG - 1)/HG, args.Ts*args.S, 256, 1, 1);
+            static const bool relpos_twice = getenv("GGML_METAL_RELPOS_TWICE") != nullptr;
+            if (relpos_twice) { // profiling only: the same output written twice, to time the kernel end to end
+                ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((args.NK + CH - 1)/CH), (args.H + HG - 1)/HG, args.Ts*args.S, 256, 1, 1);
+            }
 
             return 7;
         }

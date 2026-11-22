@@ -25,6 +25,13 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+// hill-climb profiling (GGML_METAL_OPPROF): move the op context to a new command buffer, the i-th encodable node, and a
+// per-graph table of GPU time per op group
+void                 ggml_metal_op_swap_cmd_buf(ggml_metal_op_t ctx, ggml_metal_cmd_buf_t cmd_buf);
+struct ggml_tensor * ggml_metal_op_node_at     (ggml_metal_op_t ctx, int i);
+void                 ggml_metal_opprof_add     (const struct ggml_tensor * t, int n_nodes, double seconds);
+void                 ggml_metal_opprof_dump    (int n_nodes_graph);
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //

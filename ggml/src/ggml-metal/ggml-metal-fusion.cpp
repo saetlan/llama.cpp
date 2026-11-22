@@ -793,6 +793,97 @@ static bool ggml_metal_fusion_check_mix_tail(
     return true;
 }
 
+// inkling2 mix() for a batch of tokens: raw TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT, the queries being a REPEAT made
+// elsewhere. Same kernels as the general one-token path, with the token as grid z: per token and query, the softmax
+// and the second product (an F32 matvec over nr <= 8 terms) keep the arithmetic of the separate kernels.
+static bool ggml_metal_fusion_check_mix_tail_t(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    static const bool disabled = getenv("GGML_METAL_MIX_TAILT_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * cont = nodes[0];
+    const ggml_tensor * mm1  = nodes[1];
+    const ggml_tensor * sm   = nodes[2];
+    const ggml_tensor * mm2  = nodes[3];
+
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 3];
+    if (r1 - r0 + 2 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 1; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * tr     = cont->src[0];
+    const ggml_tensor * states = mm1->src[0];
+    const ggml_tensor * qy     = mm1->src[1];
+
+    if (tr == nullptr || tr->op != GGML_OP_TRANSPOSE || tr->src[0] != states || qy == nullptr || sm->src[0] != mm1 ||
+        sm->src[1] != nullptr || mm2->src[0] != cont || mm2->src[1] != sm) {
+        return false;
+    }
+    float max_bias;
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+
+    const ggml_tensor * f32s[] = { states, qy, cont, mm1, sm, mm2 };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t E = states->ne[0], nr = states->ne[1], T = states->ne[2];
+    const int64_t nq = mm2->ne[1];
+    if (max_bias != 0.0f || T < 2 || nr < 1 || nr > 8 || states->ne[3] != 1 || !ggml_is_contiguous_rows(states) ||
+        mm1->ne[0] != nr || mm1->ne[1] != nq || mm1->ne[2] != T || mm1->ne[3] != 1 ||
+        mm2->ne[0] != E || mm2->ne[2] != T || mm2->ne[3] != 1 || !ggml_is_contiguous(mm2) || !ggml_is_contiguous(mm1) ||
+        sm->ne[0] != nr || !ggml_is_contiguous(sm) || qy->ne[0] != E || qy->ne[1] != nq || qy->ne[2] != T) {
+        return false;
+    }
+
+    // the copy, the scores and the softmax are consumed only inside the group
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // the tail kernel reads the states and the scores (mm1) while writing mm2
+        if (overlap(mm2, root(states)) || overlap(mm2, mm1)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // out = c * sigmoid(g), as UNARY(sigmoid) MUL (inkling2 attention output gate)
 static bool ggml_metal_fusion_check_gate_mul(
         const ggml_metal_fusion       * fusion,
@@ -1889,6 +1980,7 @@ static const std::vector<ggml_op> ops_sconv_res = { GGML_OP_CONCAT, GGML_OP_VIEW
 static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT,
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_mix_tail_t = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_gate_mv  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_cat_mv          = { GGML_OP_CONCAT, GGML_OP_MUL_MAT };
@@ -1969,6 +2061,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_STORE, ops_norm_store, {}, true, ggml_metal_fusion_check_norm_store },
     { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
+    { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail_t, {}, true, ggml_metal_fusion_check_mix_tail_t },
     { GGML_METAL_FUSION_GATE_MV,  ops_gate_mv,  {}, true,  ggml_metal_fusion_check_gate_mv  },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
     { GGML_METAL_FUSION_CAT_MV,      ops_cat_mv,        {}, true, ggml_metal_fusion_check_cat_mv },
@@ -2060,7 +2153,12 @@ static void ggml_metal_fusion_add_pattern_alloc_deps(
 
     // the mix tail kernel reads the scores product (an inner node) while writing the output: keep it alive too
     if (fusion->id == GGML_METAL_FUSION_MIX_TAIL) {
-        add_alloc_dep(user_data, gf->nodes[node_idx + 3], gf->nodes[last_node]);
+        for (int j = 0; j < (int) fusion->ops_all.size(); ++j) {
+            if (fusion->ops_all[j] == GGML_OP_MUL_MAT) {
+                add_alloc_dep(user_data, gf->nodes[node_idx + j], gf->nodes[last_node]);
+                break;
+            }
+        }
     }
 }
 

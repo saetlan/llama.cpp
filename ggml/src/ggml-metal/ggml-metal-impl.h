@@ -861,6 +861,9 @@ typedef struct {
     uint64_t nbs1;  // states row stride
     uint64_t nbp1;  // scores: per query
     uint64_t nbd1;  // out: per query
+    uint64_t nbs2;  // per token (grid z)
+    uint64_t nbp2;
+    uint64_t nbd2;
     float    scale;
 } ggml_metal_kargs_mix_tail;
 

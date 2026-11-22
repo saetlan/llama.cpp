@@ -4736,6 +4736,26 @@ struct test_mix_tail_fuse : public test_case {
     }
 };
 
+// hill-climb: inkling2 mix() for a batch of tokens, exercises the Metal MIX_TAIL token-batch path
+struct test_mix_tail_t_fuse : public test_case {
+    const int64_t E, nr, nq, T;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MIX_TAIL_T_FUSE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-8; }
+    std::string vars() override { return VARS_TO_STR4(E, nr, nq, T); }
+    test_mix_tail_t_fuse(int64_t E = 2304, int64_t nr = 4, int64_t nq = 1, int64_t T = 5) : E(E), nr(nr), nq(nq), T(T) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, nr, T); ggml_set_name(x, "x");
+        ggml_tensor * states = ggml_rms_norm(ctx, x, 1e-6f);
+        // per-token queries as an input (in the model they are a REPEAT that lands earlier in the graph)
+        ggml_tensor * queries = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, nq, T); ggml_set_name(queries, "queries");
+        ggml_tensor * scores = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, states, queries), nullptr, 1.0f/sqrtf((float) E), 0.0f);
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_gate_mul_fuse : public test_case {
     const int64_t n, T;
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "GATE_MUL_FUSE"; }
@@ -9409,6 +9429,20 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// hill-climb: per-head mask with every position visible (one-token decode with a learned rel-pos bias)
+struct test_flash_attn_ext_dense_mask : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",dense_mask=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "m"), -2.0f, 2.0f);
+    }
+};
+
 // mask with 2 heads and 2 batches, broadcast over the Q heads and batches
 struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     using test_flash_attn_ext::test_flash_attn_ext;
@@ -10945,7 +10979,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_situ_fuse({1152, 8, 7})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 512})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 333}));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 3}, true));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 8, 3}, false));
-        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_mix_tail_fuse(2304, 4, 1)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 6, 4)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 1, 3)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 1)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 5)); test_cases.emplace_back(new test_relpos_fuse(1280, 1)); test_cases.emplace_back(new test_relpos_fuse(4352, 1)); test_cases.emplace_back(new test_relpos_fuse(1536, 5)); test_cases.emplace_back(new test_relpos_fuse(4352, 37)); test_cases.emplace_back(new test_relpos_fuse(9000, 3)); test_cases.emplace_back(new test_relpos_fuse(20000, 1)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
+        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_mix_tail_fuse(2304, 4, 1)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 6, 4)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 1, 3)); for (auto c : std::vector<std::array<int64_t, 3>>{{4, 1, 7}, {3, 1, 5}, {5, 3, 4}, {2, 1, 33}, {8, 4, 3}, {4, 3, 512}, {4, 3, 7}, {4, 1, 512}, {3, 3, 512}, {4, 3, 64}, {4, 3, 128}, {5, 1, 512}}) { test_cases.emplace_back(new test_mix_tail_t_fuse(2304, c[0], c[1], c[2])); } test_cases.emplace_back(new test_gate_mul_fuse(3072, 1)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 5)); test_cases.emplace_back(new test_relpos_fuse(1280, 1)); test_cases.emplace_back(new test_relpos_fuse(4352, 1)); test_cases.emplace_back(new test_relpos_fuse(1536, 5)); test_cases.emplace_back(new test_relpos_fuse(4352, 37)); test_cases.emplace_back(new test_relpos_fuse(9000, 3)); test_cases.emplace_back(new test_relpos_fuse(20000, 1)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two
@@ -13945,6 +13979,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_MXFP4}) {
         test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, 512, 2304));
         test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, 512, 1152));
+    }
+    // hill-climb: inkling2 one-token flash attention (24 q heads, 8 kv heads, per-head rel-pos mask)
+    for (int64_t kv : {1536, 16384, 32768, 65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext_dense_mask(128, 128, 8, {3, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 24));
     }
     // hill-climb: other inkling2 fusions at a 512-token prompt batch
     test_cases.emplace_back(new test_situ_fuse({1152, 8, 512}));

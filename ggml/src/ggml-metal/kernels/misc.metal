@@ -847,6 +847,9 @@ kernel void kernel_mix_tail_f32(
     if (e >= args.E) {
         return;
     }
+    states += tgpig.z*args.nbs2;
+    scores += tgpig.z*args.nbp2;
+    dst    += tgpig.z*args.nbd2;
     device const float * sc = (device const float *) (scores + q*args.nbp1);
     float p[8];
     float mx = -INFINITY;
@@ -865,6 +868,95 @@ kernel void kernel_mix_tail_f32(
         o += ((device const float *) (states + r*args.nbs1))[e] * (p[r]*inv);
     }
     ((device float *) (dst + q*args.nbd1))[e] = o;
+}
+
+// kernel_mix_tail_f32 for a batch of tokens (grid z) with the softmax of each (token, query) row done by simdgroup 0
+// exactly as kernel_soft_max_f32 (nr % 4 != 0) or kernel_soft_max_f32_4 (nr % 4 == 0) do it with 32 threads and no mask
+// (same lanes, same expressions, same simd_max/simd_sum), so the weights match the separate softmax bit for bit; the
+// weighted sum is kernel_mul_mv_f32_f32_short's dot over the nr terms. `smask` is the scores buffer bound twice, which
+// makes the mask pointer null at run time like the separate kernel's src1 == src0 binding.
+kernel void kernel_mix_tail_t_f32(
+        constant ggml_metal_kargs_mix_tail & args,
+        device const char * states,
+        device const char * scores,
+        device const char * smask,
+        device       char * dst,
+        threadgroup  float * pw [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int q = tgpig.y;
+    states += tgpig.z*args.nbs2;
+    dst    += tgpig.z*args.nbd2 + q*args.nbd1;
+
+    if (sgitg == 0) {
+        const float slope = 1.0f;
+        if (args.nr % 4 == 0) {
+            device const float4 * psrc4 = (device const float4 *) (scores + tgpig.z*args.nbp2 + q*args.nbp1);
+            device const  float * pmask = smask != scores ? (device const float *) (smask + tgpig.z*args.nbp2 + q*args.nbp1) : nullptr;
+
+            float4 lmax4 = -INFINITY;
+            for (int i00 = tiisg; i00 < args.nr/4; i00 += N_SIMDWIDTH) {
+                lmax4 = fmax(lmax4, psrc4[i00]*args.scale + (float4)((pmask ? slope*pmask[i00] : 0.0f)));
+            }
+            const float lmax = MAX(MAX(lmax4[0], lmax4[1]), MAX(lmax4[2], lmax4[3]));
+            const float max_val = simd_max(lmax);
+
+            float4 lsum4 = 0.0f;
+            float4 ev4   = 0.0f;
+            for (int i00 = tiisg; i00 < args.nr/4; i00 += N_SIMDWIDTH) {
+                const float4 exp_psrc4 = exp((psrc4[i00]*args.scale + (float4)((pmask ? slope*pmask[i00] : 0.0f))) - max_val);
+                lsum4 += exp_psrc4;
+                ev4 = exp_psrc4;
+            }
+            const float lsum = lsum4[0] + lsum4[1] + lsum4[2] + lsum4[3];
+            const float sum = simd_sum(lsum);
+            const float inv_sum = 1.0f/sum;
+            if (tiisg < args.nr/4) {
+                ev4 *= inv_sum;
+                pw[4*tiisg + 0] = ev4[0];
+                pw[4*tiisg + 1] = ev4[1];
+                pw[4*tiisg + 2] = ev4[2];
+                pw[4*tiisg + 3] = ev4[3];
+            }
+        } else {
+            device const float * psrc0 = (device const float *) (scores + tgpig.z*args.nbp2 + q*args.nbp1);
+            device const float * pmask = smask != scores ? (device const float *) (smask + tgpig.z*args.nbp2 + q*args.nbp1) : nullptr;
+
+            float lmax = -INFINITY;
+            for (int i00 = tiisg; i00 < args.nr; i00 += N_SIMDWIDTH) {
+                lmax = MAX(lmax, psrc0[i00]*args.scale + (pmask ? slope*pmask[i00] : 0.0f));
+            }
+            const float max_val = simd_max(lmax);
+
+            float lsum = 0.0f;
+            float ev   = 0.0f;
+            for (int i00 = tiisg; i00 < args.nr; i00 += N_SIMDWIDTH) {
+                const float exp_psrc0 = exp((psrc0[i00]*args.scale + (pmask ? slope*pmask[i00] : 0.0f)) - max_val);
+                lsum += exp_psrc0;
+                ev = exp_psrc0;
+            }
+            const float sum = simd_sum(lsum);
+            const float inv_sum = 1.0f/sum;
+            if (tiisg < args.nr) {
+                ev *= inv_sum;
+                pw[tiisg] = ev;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int e = tgpig.x*256 + tpitg;
+    if (e >= args.E) {
+        return;
+    }
+    float res = 0.0f;
+    for (int i = 0; i < args.nr; ++i) {
+        res += (float) ((device const float *) (states + i*args.nbs1))[e] * (float) pw[i];
+    }
+    ((device float *) dst)[e] = res;
 }
 
 // kernel_mix_tail_f32 for one query, with the scores computed here: each group of 4 simdgroups computes two score
