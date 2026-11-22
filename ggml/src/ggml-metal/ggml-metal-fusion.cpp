@@ -1285,10 +1285,18 @@ static bool ggml_metal_fusion_check_cat_mv(
     const ggml_tensor * w = mm->src[0];
     if (!a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || cat->type != GGML_TYPE_F32 ||
         w->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
-        cat->ne[1] != 1 || cat->ne[2] != 1 || cat->ne[3] != 1 || ggml_nelements(a) != a->ne[0] || ggml_nelements(b) != b->ne[0] ||
+        cat->ne[2] != 1 || cat->ne[3] != 1 || a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1 ||
+        a->ne[1] != cat->ne[1] || b->ne[1] != cat->ne[1] ||
         a->ne[0] % 16 != 0 || b->ne[0] % 16 != 0 || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) ||
+        a->nb[1] % 16 != 0 || b->nb[1] % 16 != 0 ||
         w->ne[0] != cat->ne[0] || w->ne[0] < 512 || w->ne[0] % 32 != 0 || w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != sizeof(float) ||
-        w->nb[1] % 16 != 0 || mm->ne[0] != w->ne[1] || mm->ne[1] != 1 || mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm)) {
+        w->nb[1] % 16 != 0 || mm->ne[0] != w->ne[1] || mm->ne[1] != cat->ne[1] || mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    // one token: the f32_4 replica; 2..5 tokens: the mv_ext replica, only where the separate product takes mv_ext
+    static const bool t1_only = getenv("GGML_METAL_CAT_MV_T1") != nullptr;
+    const int64_t T = cat->ne[1];
+    if (T < 1 || T > 5 || (T > 1 && (t1_only || w->ne[0] % 128 != 0 || ggml_metal_op_mul_mat_use_mma(mm)))) {
         return false;
     }
     if ((((uintptr_t) a->data) % 16) != 0 || (((uintptr_t) b->data) % 16) != 0) {

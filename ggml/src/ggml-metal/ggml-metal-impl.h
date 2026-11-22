@@ -821,6 +821,11 @@ typedef struct {
     int32_t  ne01;  // output rows
     int32_t  Na;    // elements taken from a
     uint64_t nb01;  // weight row stride
+    int32_t  T;     // tokens (token batches: the mv_ext replica)
+    uint64_t nba1;  // per token: a, b
+    uint64_t nbb1;
+    int16_t  nsg;   // mv_ext parameters of the separate product
+    int16_t  nxpsg;
 } ggml_metal_kargs_cat_mv;
 
 typedef struct {

@@ -5974,6 +5974,34 @@ int ggml_metal_op_cat_mv_fused(ggml_metal_op_t ctx, int idx) {
     args.ne01 = (int32_t) w->ne[1];
     args.Na   = (int32_t) a->ne[0];
     args.nb01 = w->nb[1];
+    args.T    = (int32_t) mm->ne[1];
+    args.nba1 = a->nb[1];
+    args.nbb1 = b->nb[1];
+
+    // token batches: the separate product's mv_ext kernel (nsg 2, nxpsg and rows per threadgroup as in ggml_metal_op_mul_mat)
+    if (args.T > 1) {
+        const int16_t nsg   = 2;
+        const int16_t nxpsg = (args.ne00 % 256 == 0 && args.T < 3) ? 16 : 8;
+        const int16_t r0ptg = (32/nxpsg)*nsg;
+        const int16_t r1ptg = args.T == 2 ? 2 : args.T == 3 ? 3 : args.T == 4 ? 4 : 5;
+        args.nsg   = nsg;
+        args.nxpsg = nxpsg;
+
+        char name[64];
+        snprintf(name, sizeof(name), "kernel_cat_mv_ext_f32_r1_%d", r1ptg);
+        auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, name);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),  1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a),  2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),  3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm), 4);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne01 + r0ptg - 1)/r0ptg, (args.T + r1ptg - 1)/r1ptg, 1, 32, nsg, 1);
+
+        return 2;
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_cat_mv_f32");
 

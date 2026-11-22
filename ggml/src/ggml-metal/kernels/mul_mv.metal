@@ -3211,6 +3211,101 @@ kernel void kernel_mul_mv_mxfp4_f32(
 
 // NVFP4: blocks of 64 values = 4 sub-blocks of 16 with a UE4M3 scale each, 36 bytes (word aligned).
 // 4 threads per block, one sub-block each (8 quant bytes = two words); 8 blocks per simdgroup step
+// kernel_mul_mv_ext_q4_f32_impl<r1ptg, float4, 1, dequantize_f32_t4> (the small-batch f32 product the separate
+// MUL_MAT takes for 2..8 tokens when ne00 % 128 == 0) with each float4 chunk of src1 read from a or from b; nsg and
+// nxpsg are the separate product's function constants, passed at run time (same lanes, same order, same shuffles)
+template<short r1ptg>
+kernel void kernel_cat_mv_ext_f32(
+        constant ggml_metal_kargs_cat_mv & args,
+        device const char * src0,
+        device const char * a,
+        device const char * b,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG   = args.nsg;
+    const short nxpsg = args.nxpsg;
+
+    const short chpt = 4;
+    const short nypsg = (32/nxpsg);
+
+    const short tx = tiisg%nxpsg;
+    const short ty = tiisg/nxpsg;
+
+    const int i01 = tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty;
+    const int i11 = tgpig.y*r1ptg;
+
+    device const float4 * xq = (i01 < args.ne01) ? (device const float4 *) (src0 + (uint64_t) i01*args.nb01) + tx : (device const float4 *) src0;
+
+    const int na4 = args.Na/4;
+
+    device const float4 * ya[r1ptg];
+    device const float4 * yb[r1ptg];
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        const int t = (i11 + ir1 < args.T) ? i11 + ir1 : 0;
+        ya[ir1] = (device const float4 *) (a + (uint64_t) t*args.nba1);
+        yb[ir1] = (device const float4 *) (b + (uint64_t) t*args.nbb1);
+    }
+
+    float sumf[r1ptg] = { [ 0 ... r1ptg - 1 ] = 0.0f };
+
+    for (int ich = tx; 4*ich < args.ne00; ich += chpt*nxpsg) {
+        float4 lx[chpt];
+
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+            lx[ch] = *xq;
+            xq += nxpsg;
+        }
+
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+            const int j = ich + ch*nxpsg;
+#pragma unroll(r1ptg)
+            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                const float4 yv = j < na4 ? ya[ir1][j] : yb[ir1][j - na4];
+                sumf[ir1] += dot(lx[ch], yv);
+            }
+        }
+    }
+
+    // reduce only the threads in each row
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+        }
+        if (nxpsg >= 16) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  8);
+        }
+        if (nxpsg >= 8) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  4);
+        }
+        if (nxpsg >= 4) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  2);
+        }
+        if (nxpsg >= 2) {
+            sumf[ir1] += simd_shuffle_down(sumf[ir1],  1);
+        }
+    }
+
+    if (tx == 0) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.T; ++ir1) {
+            device float * dst_f32 = (device float *) dst + (uint64_t)(i11 + ir1)*args.ne01;
+
+            if (i01 < args.ne01) {
+                dst_f32[i01] = sumf[ir1];
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_cat_mv_ext_f32<2>) cat_mv_ext_f32_t;
+template [[host_name("kernel_cat_mv_ext_f32_r1_2")]] kernel cat_mv_ext_f32_t kernel_cat_mv_ext_f32<2>;
+template [[host_name("kernel_cat_mv_ext_f32_r1_3")]] kernel cat_mv_ext_f32_t kernel_cat_mv_ext_f32<3>;
+template [[host_name("kernel_cat_mv_ext_f32_r1_4")]] kernel cat_mv_ext_f32_t kernel_cat_mv_ext_f32<4>;
+template [[host_name("kernel_cat_mv_ext_f32_r1_5")]] kernel cat_mv_ext_f32_t kernel_cat_mv_ext_f32<5>;
+
 // rows c (gain) and E + c (forget) of the packed matvec as kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2>
 // computes each row with NSG = 1 (same lanes, same order, same two-level simd_sum), then kernel_ctrl_mix_f32's blend
 // on channel c; one simdgroup (threadgroup) per channel
