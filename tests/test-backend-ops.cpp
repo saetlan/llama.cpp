@@ -13929,6 +13929,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_relpos_fuse(65536, 512));
     test_cases.emplace_back(new test_relpos_fuse(1536, 1));
     test_cases.emplace_back(new test_relpos_fuse(131072, 1));
+    // hill-climb: inkling2 expert matmuls at a 512-token prompt batch (gate_up and down shapes)
+    for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_MXFP4}) {
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, 512, 2304));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, 512, 1152));
+    }
     // hill-climb: other inkling2 fusions at a 512-token prompt batch
     test_cases.emplace_back(new test_situ_fuse({1152, 8, 512}));
     test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 512}, true));
