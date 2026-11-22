@@ -6376,10 +6376,10 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
     // prompt batches: the bias table once per (token, head group) in threadgroup memory, then a gather
     {
         const int64_t Ep = bias->ne[1];
-        const int     HG = 4;
+        const int     HG = 4; // 6 (fewer bias-table re-reads) measured slower: occupancy
         // prompt batches have enough (token, head group) threadgroups: one kv chunk each, so the table is built once
         const int     CH = (int64_t) args.Ts*args.S >= 64 ? std::max<int>(4096, args.NK) : 4096;
-        const size_t  smem = (size_t) HG*Ep*sizeof(float);
+        const size_t  smem = GGML_PAD((size_t) HG*Ep*sizeof(float), 16);
         if (((int64_t) args.Ts*args.S > 1 || args.NK >= 16384) && smem <= 32768 && getenv("GGML_METAL_RELPOS2_DISABLE") == nullptr) {
             ggml_metal_kargs_relpos2 a2 = {};
             a2.r  = args;
