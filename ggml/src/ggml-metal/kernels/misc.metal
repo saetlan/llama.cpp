@@ -596,6 +596,60 @@ kernel void kernel_sconv_par_f32(
 // one token, dynamic taps: out = (cur + (conv + sum_lag x[3-lag]*tap[lag, head]))*sc, in the unfused rounding order
 // K clip or V rms_norm of one head row (one SIMD group), written as f16 into the cache row of its token:
 // same reductions as kernel_sum_rows_f32_f32_4 / kernel_rms_norm_fuse_impl<float4,1>, then the set_rows cast
+// rms_norm of one token row of x (same reduction as kernel_rms_norm_fuse_impl<float4, 1>, so the normed values are
+// identical), written to nrm, and the concat [stack rows; normed row] written to cat; one threadgroup per token
+kernel void kernel_norm_concat_f32(
+        constant ggml_metal_kargs_norm_concat & args,
+        device const char * x,
+        device const char * stk,
+        device       char * nrm,
+        device       char * cat,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int t = tgpig.x;
+
+    device const float4 * xr = (device const float4 *) (x + t*args.nbx1);
+
+    float sumf = 0.0f;
+    for (int i = tpitg.x; i < args.E4; i += ntg.x) {
+        sumf += dot(xr[i], xr[i]);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/args.E;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    device float4 * yn = (device float4 *) (nrm + t*args.nbn1);
+    device float4 * yc = (device float4 *) (cat + t*args.nbc2);
+    for (int i = tpitg.x; i < args.E4; i += ntg.x) {
+        const float4 v = xr[i]*scale;
+        yn[i] = v;
+        for (int r = 0; r < args.K; ++r) {
+            ((device float4 *) ((device char *) yc + r*args.nbc1))[i] = ((device const float4 *) (stk + r*args.nbs1 + t*args.nbs2))[i];
+        }
+        ((device float4 *) ((device char *) yc + args.K*args.nbc1))[i] = v;
+    }
+}
+
 kernel void kernel_row_store_f32_f16(
         constant ggml_metal_kargs_row_store & args,
         device const char * src,

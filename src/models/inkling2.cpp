@@ -171,6 +171,12 @@ void llama_model_inkling2::load_post_tensors() {
         if (packed) {
             qgrs[layer.wq] = packed;
         }
+        if (layer.attn_rel_bias && layer.attn_rel_bias->type == GGML_TYPE_F32) {
+            snprintf(name, sizeof(name), "blk.%d.attn_rel_bias.padded", i);
+            if (ggml_tensor * rp = pack_weight_rows({ layer.attn_rel_bias }, name, 1)) {
+                rel_pad[layer.attn_rel_bias] = rp;
+            }
+        }
         if (!hparams.is_swa(i) && layer.attn_k_conv_proj && layer.attn_v_conv_proj) {
             snprintf(name, sizeof(name), "blk.%d.attn_kd.packed", i);
             if (ggml_tensor * kd = pack_weight_rows({ layer.wk, layer.attn_k_conv_proj }, name)) {
@@ -518,7 +524,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         ggml_tensor * rel_bias = pad_cache[layer.attn_rel_bias];
         if (!rel_bias) {
-            rel_bias = pad_cache[layer.attn_rel_bias] = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+            const auto & m = static_cast<const llama_model_inkling2 &>(model);
+            auto ip = m.rel_pad.find(layer.attn_rel_bias);
+            rel_bias = pad_cache[layer.attn_rel_bias] = ip != m.rel_pad.end()
+                ? ip->second
+                : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
         }
         ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias, Rcur);
 

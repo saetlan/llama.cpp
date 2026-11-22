@@ -1116,6 +1116,60 @@ static bool ggml_metal_fusion_check_mv_id_scale(
     return true;
 }
 
+// inkling2 mix_states: states = concat(block_stack, rms_norm(cur) as [E, 1, T], dim 1). The normed rows are a group
+// output too (norm_once shares them with later stacks), so the kernel writes both; unsafe = true, validated here
+static bool ggml_metal_fusion_check_norm_concat(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * nrm = nodes[0];
+    const ggml_tensor * cat = nodes[1];
+    const ggml_tensor * x   = nrm->src[0];
+    const ggml_tensor * stk = cat->src[0];
+    const ggml_tensor * nv  = cat->src[1];
+
+    auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+
+    if (ggml_get_op_params_i32(cat, 0) != 1 || root(nv) != nrm || (nv != nrm && nv->op != GGML_OP_RESHAPE)) {
+        return false;
+    }
+    const int64_t E = x->ne[0];
+    const int64_t T = x->ne[1];
+    if (x->type != GGML_TYPE_F32 || nrm->type != GGML_TYPE_F32 || stk->type != GGML_TYPE_F32 || cat->type != GGML_TYPE_F32 ||
+        E % 4 != 0 || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) || x->nb[1] % 16 != 0 ||
+        !ggml_is_contiguous(nrm) || !ggml_is_contiguous(cat) ||
+        stk->ne[0] != E || stk->ne[2] != T || stk->ne[3] != 1 || stk->nb[0] != sizeof(float) || stk->nb[1] % 16 != 0 ||
+        stk->nb[2] % 16 != 0 || cat->ne[0] != E || cat->ne[1] != stk->ne[1] + 1 || cat->ne[2] != T || cat->ne[3] != 1 ||
+        nv->ne[0] != E || nv->ne[1] != 1 || nv->ne[2] != T) {
+        return false;
+    }
+    if (cat->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // cat is written while x and the stack are read; nrm is written while the stack is read
+        if (overlap(cat, root(x)) || overlap(cat, root(stk)) || overlap(cat, nrm) || overlap(nrm, root(stk))) {
+            return false;
+        }
+    }
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1673,6 +1727,8 @@ static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAP
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_norm_concat     = { GGML_OP_RMS_NORM, GGML_OP_CONCAT };
+static const std::vector<ggml_op> ops_norm_concat_r   = { GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_CONCAT };
 static const std::vector<ggml_op> ops_mv_id_scale     = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_mv_id_scale_rep = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
 // raw: CONCAT VIEW VIEW CPY SSM_CONV RESHAPE, lag 0 (window VIEW TRANSPOSE CONT RESHAPE, RESHAPE of the projection, tap VIEW,
@@ -1745,6 +1801,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
+    { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat,   {}, true, ggml_metal_fusion_check_norm_concat },
+    { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat_r, {}, true, ggml_metal_fusion_check_norm_concat },
     { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale,     {}, true, ggml_metal_fusion_check_mv_id_scale },
     { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale_rep, {}, true, ggml_metal_fusion_check_mv_id_scale },
     { GGML_METAL_FUSION_RELPOS, ops_relpos, {}, true, ggml_metal_fusion_check_relpos },

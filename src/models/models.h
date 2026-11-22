@@ -2510,6 +2510,8 @@ struct llama_model_inkling2 : public llama_model_base {
     // followed by wk and wv on SWA layers; on full-attention layers wk|attn_k_conv_proj and wv|attn_v_conv_proj
     std::map<const ggml_tensor *, ggml_tensor *> qgrs;
     std::map<const ggml_tensor *, ggml_tensor *> kdyn;
+    // hill-climb: attn_rel_bias with one zero row appended (what the graph pads to), keyed by attn_rel_bias
+    std::map<const ggml_tensor *, ggml_tensor *> rel_pad;
     void load_post_tensors() override;
 
     struct graph : public llm_graph_context {

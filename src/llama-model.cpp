@@ -2218,20 +2218,26 @@ void llama_model_base::keep_weights(ggml_context_ptr && ctx, ggml_backend_buffer
     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
 }
 
-ggml_tensor * llama_model_base::pack_weight_rows(const std::vector<const ggml_tensor *> & parts, const char * name) {
+ggml_tensor * llama_model_base::pack_weight_rows(const std::vector<const ggml_tensor *> & parts, const char * name, int64_t zero_rows) {
     GGML_ASSERT(!parts.empty());
     const ggml_tensor * p0 = parts[0];
     int64_t rows = 0;
     for (const ggml_tensor * p : parts) {
         if (!p || p->type != p0->type || p->ne[0] != p0->ne[0] || p->ne[2] != 1 || p->ne[3] != 1 || !ggml_is_contiguous(p) ||
-            p->buffer == nullptr) {
+            p->buffer == nullptr || p->data == nullptr) { // no data: weights not loaded (no_alloc)
             return nullptr;
         }
         rows += p->ne[1];
     }
+    rows += zero_rows;
     ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p0->buffer);
     if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            for (const ggml_tensor * p : parts) {
+                if (!ggml_backend_buft_is_host(ggml_backend_buffer_get_type(p->buffer))) {
+                    return nullptr; // CPU extra buffer (repacked layout): rows can't be copied as stored
+                }
+            }
             buft = ggml_backend_dev_buffer_type(dev);
         }
     }
@@ -2259,6 +2265,10 @@ ggml_tensor * llama_model_base::pack_weight_rows(const std::vector<const ggml_te
         ggml_backend_tensor_get(p, tmp.data(), 0, n);
         ggml_backend_tensor_set(packed, tmp.data(), offs, n);
         offs += n;
+    }
+    if (zero_rows > 0) {
+        tmp.assign(ggml_nbytes(packed) - offs, 0);
+        ggml_backend_tensor_set(packed, tmp.data(), offs, tmp.size());
     }
     keep_weights(std::move(ctx), std::move(buffer));
     return packed;

@@ -4740,6 +4740,10 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_row_store_fused(ctx, idx, n, 1);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_CONCAT) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_norm_concat_fused(ctx, idx);
+        }
     }
 
     ggml_tensor * op = ctx->node(idx);
@@ -5557,7 +5561,61 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
     return 4;
 }
 
-// gate: idx is the sigmoid; out = c*sigmoid(g)
+// depth-mix states: rms_norm + concat onto the block stack; idx is the RMS_NORM, the CONCAT is idx + 1
+int ggml_metal_op_norm_concat_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_tensor * nrm = ctx->node(idx);
+    ggml_tensor * cat = ctx->node(idx + 1);
+    const ggml_tensor * x   = nrm->src[0];
+    const ggml_tensor * stk = cat->src[0];
+
+    for (int i = 0; i < 2; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    float eps;
+    memcpy(&eps, nrm->op_params, sizeof(float));
+
+    ggml_metal_kargs_norm_concat args = {};
+    args.E4    = (int32_t) (x->ne[0]/4);
+    args.K     = (int32_t) stk->ne[1];
+    args.eps   = eps;
+    args.E     = (int32_t) x->ne[0];
+    args.nbx1  = x->nb[1];
+    args.nbs1  = stk->nb[1];
+    args.nbs2  = stk->nb[2];
+    args.nbn1  = nrm->nb[1];
+    args.nbc1  = cat->nb[1];
+    args.nbc2  = cat->nb[2];
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_norm_concat_f32");
+
+    // the thread count of the rms_norm dispatch, so the reduction tree is the same
+    int nth = 32;
+    while (nth < args.E4 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    nth = std::min(nth, (args.E4 + 31)/32*32);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(stk), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(nrm), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cat), 4);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, x->ne[1], 1, 1, nth, 1, 1);
+
+    return 2;
+}
+
 // NVFP4 MUL_MAT_ID (matvec) with the per-expert scale applied in the kernel; idx is the MUL_MAT_ID, n the group size
 int ggml_metal_op_mv_id_scale_fused(ggml_metal_op_t ctx, int idx, int n) {
     ggml_metal_library_t lib = ctx->lib;
@@ -5628,6 +5686,7 @@ int ggml_metal_op_mv_id_scale_fused(ggml_metal_op_t ctx, int idx, int n) {
     return n;
 }
 
+// gate: idx is the sigmoid; out = c*sigmoid(g)
 int ggml_metal_op_gate_mul_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;

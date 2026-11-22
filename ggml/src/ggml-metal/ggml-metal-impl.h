@@ -793,6 +793,19 @@ typedef struct {
 } ggml_metal_kargs_row_store;
 
 typedef struct {
+    int32_t  E4;    // float4 per row
+    int32_t  K;     // stack rows
+    float    eps;
+    int32_t  E;     // row length (the mean divides by it, as rms_norm does)
+    uint64_t nbx1;  // x row (token) stride
+    uint64_t nbs1;  // stack row stride
+    uint64_t nbs2;  // stack token stride
+    uint64_t nbn1;  // normed token stride
+    uint64_t nbc1;  // concat row stride
+    uint64_t nbc2;  // concat token stride
+} ggml_metal_kargs_norm_concat;
+
+typedef struct {
     int32_t  NR;    // relative features
     int32_t  H;
     int32_t  NK;    // kv cells
