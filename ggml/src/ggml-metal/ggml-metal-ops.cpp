@@ -5893,6 +5893,37 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
     args.nbm1 = mask->nb[1];
     args.nbm3 = mask->nb[3];
 
+    // prompt batches: the bias table once per (token, head group) in threadgroup memory, then a gather
+    {
+        const int64_t Ep = bias->ne[1];
+        const int     HG = 4;
+        const int     CH = 4096;
+        const size_t  smem = (size_t) HG*Ep*sizeof(float);
+        if (((int64_t) args.Ts*args.S > 1 || args.NK >= 16384) && smem <= 32768 && getenv("GGML_METAL_RELPOS2_DISABLE") == nullptr) {
+            ggml_metal_kargs_relpos2 a2 = {};
+            a2.r  = args;
+            a2.Ep = (int32_t) Ep;
+            a2.HG = HG;
+            a2.CH = CH;
+
+            auto pipeline2 = ggml_metal_library_get_pipeline_by_name(lib, "kernel_relpos_mask2_f32");
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline2);
+            ggml_metal_encoder_set_bytes   (enc, &a2, sizeof(a2), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias),  1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(R),     2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sinks), 3);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(relp),  4);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask),  5);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy),   6);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((args.NK + CH - 1)/CH), (args.H + HG - 1)/HG, args.Ts*args.S, 256, 1, 1);
+
+            return 7;
+        }
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_relpos(lib);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

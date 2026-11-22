@@ -830,6 +830,13 @@ typedef struct {
 } ggml_metal_kargs_relpos;
 
 typedef struct {
+    ggml_metal_kargs_relpos r;
+    int32_t  Ep;    // bias table rows (relative distance buckets)
+    int32_t  HG;    // heads per threadgroup
+    int32_t  CH;    // kv cells per threadgroup
+} ggml_metal_kargs_relpos2;
+
+typedef struct {
     int32_t  E;
     int32_t  nr;
     uint64_t nbs1;  // states row stride

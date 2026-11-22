@@ -10933,7 +10933,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_situ_fuse({1152, 8, 7})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 512})); test_cases.emplace_back(new test_situ_fuse({1152, 8, 333}));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 3}, true));
         test_cases.emplace_back(new test_clip_rows_fuse({128, 8, 3}, false));
-        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_mix_tail_fuse(2304, 4, 1)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 6, 4)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 1, 3)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 1)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 5)); test_cases.emplace_back(new test_relpos_fuse(1280, 1)); test_cases.emplace_back(new test_relpos_fuse(4352, 1)); test_cases.emplace_back(new test_relpos_fuse(1536, 5)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
+        test_cases.emplace_back(new test_clip_rows_fuse({16, 24, 3}, true)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 1})); test_cases.emplace_back(new test_mix_tail_fuse(2304, 4, 1)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 6, 4)); test_cases.emplace_back(new test_mix_tail_fuse(2304, 1, 3)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 1)); test_cases.emplace_back(new test_gate_mul_fuse(3072, 5)); test_cases.emplace_back(new test_relpos_fuse(1280, 1)); test_cases.emplace_back(new test_relpos_fuse(4352, 1)); test_cases.emplace_back(new test_relpos_fuse(1536, 5)); test_cases.emplace_back(new test_relpos_fuse(4352, 37)); test_cases.emplace_back(new test_relpos_fuse(9000, 3)); test_cases.emplace_back(new test_relpos_fuse(20000, 1)); test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 9}));
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two
@@ -13922,6 +13922,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // hill-climb: inkling2 rel-pos mask at prefill shapes (SWA cache 1536, full attention 4352 / 65536 kv)
+    test_cases.emplace_back(new test_relpos_fuse(1536, 512));
+    test_cases.emplace_back(new test_relpos_fuse(4352, 512));
+    test_cases.emplace_back(new test_relpos_fuse(65536, 512));
+    test_cases.emplace_back(new test_relpos_fuse(1536, 1));
+    test_cases.emplace_back(new test_relpos_fuse(131072, 1));
+    // hill-climb: other inkling2 fusions at a 512-token prompt batch
+    test_cases.emplace_back(new test_situ_fuse({1152, 8, 512}));
+    test_cases.emplace_back(new test_clip_rows_fuse({128, 24, 512}, true));
+    test_cases.emplace_back(new test_clip_rows_fuse({128, 8, 512}, false));
+    test_cases.emplace_back(new test_ctrl_mix_fuse({2304, 512}));
+    test_cases.emplace_back(new test_gate_mul_fuse(3072, 512));
+    test_cases.emplace_back(new test_mix_tail_fuse(2304, 6, 1));
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
