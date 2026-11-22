@@ -344,9 +344,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         bool is_concurrent = false;
 
         ctx->group_mode = false;
+        // group-aware ranges are opt-in; without them, keep the original path (match fusions only when concurrent)
+        static const bool group_on = getenv("GGML_METAL_GROUP_RANGES") != nullptr;
         int gn = 1;
-        const ggml_metal_fusion * gfu = ctx->use_fusion() ? ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &gn) : nullptr;
-        if (ctx->mem_ranges) {
+        const ggml_metal_fusion * gfu = nullptr;
+        if (group_on && ctx->use_fusion()) {
+            gfu = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &gn);
+        }
+        if (group_on && ctx->mem_ranges) {
             if (gfu && gn > 1 && ggml_metal_op_group_safe(gfu) && ctx->group_ranges(idx, gn)) {
                 // kernels that also write an inner node whatever its users: NORM_CONCAT always stores the normed row
                 if (ggml_metal_fusion_get_id(gfu) == GGML_METAL_FUSION_NORM_CONCAT) {
@@ -370,9 +375,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         if (!ctx->group_mode) {
             is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
 
-            if (is_concurrent && gfu) {
-                // fused kernels write to the last node of the group, not necessarily to the first node's dst
-                is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + gn - 1));
+            if (is_concurrent && ctx->use_fusion()) {
+                if (!group_on) {
+                    gfu = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &gn);
+                }
+                if (gfu) {
+                    // fused kernels write to the last node of the group, not necessarily to the first node's dst
+                    is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + gn - 1));
+                }
             }
 
             if (!is_concurrent) {
@@ -3190,7 +3200,15 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*(ne20*ne21 + ne02);
 }
 
+static int ggml_metal_op_mul_mat_id_ex(ggml_metal_op_t ctx, int idx, ggml_tensor * dst_over, const ggml_tensor * wscale);
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_mul_mat_id_ex(ctx, idx, nullptr, nullptr);
+}
+
+// hill-climb: dst_over receives the result (the id-map scratch stays after op's own buffer); wscale, if set, multiplies
+// each expert's rows by wscale[expert] in the mm_id store (prompt batches)
+static int ggml_metal_op_mul_mat_id_ex(ggml_metal_op_t ctx, int idx, ggml_tensor * dst_over, const ggml_tensor * wscale) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -3220,6 +3238,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
     ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[2]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_out  = dst_over ? ggml_metal_get_buffer_id(dst_over) : bid_dst;
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
@@ -3285,7 +3304,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_pipeline(enc, pipeline);
             ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
-            ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
+            ggml_metal_encoder_set_buffer  (enc, bid_out,  2);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, ne20, ne21, 1, 32, 1, 1);
         }
@@ -3294,7 +3313,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
 
         {
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_ws(lib, op, wscale != nullptr);
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
@@ -3320,7 +3339,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
-            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_buffer  (enc, bid_out,  5);
+            ggml_metal_encoder_set_buffer  (enc, wscale ? ggml_metal_get_buffer_id(wscale) : bid_out, 6);
 
             const size_t smem = pipeline.smem;
 
@@ -5908,6 +5928,12 @@ int ggml_metal_op_mv_id_scale_fused(ggml_metal_op_t ctx, int idx, int n) {
             ggml_metal_op_concurrency_reset(ctx);
             break;
         }
+    }
+
+    // prompt batches: the mm_id path with the scale applied in its store
+    if (ggml_metal_op_mul_mat_id_use_mm(op, ggml_metal_device_get_props(ctx->dev)->has_simdgroup_mm)) {
+        ggml_metal_op_mul_mat_id_ex(ctx, idx, mul, sv);
+        return n;
     }
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);

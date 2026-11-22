@@ -1070,7 +1070,7 @@ static bool ggml_metal_fusion_check_mv_id_scale(
     const ggml_tensor * ids = mm->src[2];
 
     if (mm->src[0]->type != GGML_TYPE_NVFP4 || mm->src[1]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
-        ggml_metal_op_mul_mat_id_use_mm(mm, true) || !ggml_is_contiguous(mm) || mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        !ggml_is_contiguous(mm) || mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
         return false;
     }
     if (gr->src[1] != ids || mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, mm) || !ggml_is_contiguous(mul)) {

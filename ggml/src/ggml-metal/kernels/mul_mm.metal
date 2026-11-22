@@ -8,6 +8,7 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant bool    FC_mul_mm_id_wscale    [[function_constant(FC_MUL_MM + 9)]]; // hill-climb: dst row *= wscale[expert]
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -553,6 +554,7 @@ kernel void kernel_mul_mm_id(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const char * wscale,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -874,14 +876,29 @@ kernel void kernel_mul_mm_id(
         threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
         threadgroup float4 * C4 = (threadgroup float4 *) C;
 
-        int i = tiisg;
-        for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
-        }
+        if (FC_mul_mm_id_wscale) {
+            // the per-expert weight scale, as the separate MUL by GET_ROWS(scale, ids) did it
+            const float ws = ((device const float *) wscale)[im];
 
-        i = (4*(nr0/4)) + tiisg;
-        for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
+            int i = tiisg;
+            for (; i < nr0/4; i += 32) {
+                *(D4 + i) = *(C4 + i) * ws;
+            }
+
+            i = (4*(nr0/4)) + tiisg;
+            for (; i < nr0; i += 32) {
+                *(D + i) = *(C + i) * ws;
+            }
+        } else {
+            int i = tiisg;
+            for (; i < nr0/4; i += 32) {
+                *(D4 + i) = *(C4 + i);
+            }
+
+            i = (4*(nr0/4)) + tiisg;
+            for (; i < nr0; i += 32) {
+                *(D + i) = *(C + i);
+            }
         }
     }
 }
