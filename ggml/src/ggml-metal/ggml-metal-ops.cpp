@@ -5531,6 +5531,43 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
     ggml_tensor       * mm2 = ctx->node(idx + 3);
     const ggml_tensor * states = mm1->src[0];
 
+    // one query: the scores inside the tail kernel (same arithmetic as kernel_mul_mv_f32_f32_4 with nsg 4, nr0 2,
+    // which is what the separate product uses for this shape)
+    {
+        const ggml_tensor * qy = mm1->src[1];
+        const int64_t E = states->ne[0];
+        if (qy->ne[1] == 1 && qy->ne[2] == 1 && qy->ne[3] == 1 && qy->type == GGML_TYPE_F32 && qy->nb[0] == sizeof(float) &&
+            states->type == GGML_TYPE_F32 && states->nb[0] == sizeof(float) && states->ne[2] == 1 && states->ne[3] == 1 &&
+            states->nb[1] % 16 == 0 && E % 32 == 0 && E >= 512 && states->ne[1] <= 8 && qy->ne[0] == E &&
+            mm2->ne[1] == 1 && ggml_is_contiguous(mm2) && getenv("GGML_METAL_MIX_TAIL1_DISABLE") == nullptr) {
+            for (int i = 1; i < 4; ++i) {
+                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                    break;
+                }
+            }
+
+            ggml_metal_kargs_mix_tail1 args = {};
+            args.E    = (int32_t) E;
+            args.nr   = (int32_t) states->ne[1];
+            args.nbs1 = states->nb[1];
+            memcpy(&args.scale, (const float *) sm->op_params + 0, sizeof(float));
+
+            auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_mix_tail1_f32");
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(states), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(qy),     2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm2),    3);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, (4*32 + 8)*sizeof(float), 0);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (E + 255)/256, 1, 1, 256, 1, 1);
+
+            return 4;
+        }
+    }
+
     // the scores product, with the usual dependency check
     if (!ggml_metal_op_concurrency_check(ctx, mm1)) {
         ggml_metal_op_concurrency_reset(ctx);

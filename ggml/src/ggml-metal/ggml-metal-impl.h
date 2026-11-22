@@ -806,6 +806,13 @@ typedef struct {
 } ggml_metal_kargs_norm_concat;
 
 typedef struct {
+    int32_t  E;     // channels (row length of the states), multiple of 32
+    int32_t  nr;    // states rows (<= 8)
+    uint64_t nbs1;  // states row stride
+    float    scale; // softmax scale
+} ggml_metal_kargs_mix_tail1;
+
+typedef struct {
     int32_t  NR;    // relative features
     int32_t  H;
     int32_t  NK;    // kv cells

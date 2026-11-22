@@ -808,6 +808,123 @@ kernel void kernel_mix_tail_f32(
     ((device float *) (dst + q*args.nbd1))[e] = o;
 }
 
+// kernel_mix_tail_f32 for one query, with the scores computed here: each group of 4 simdgroups computes two score
+// rows exactly as kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2> with NSG = 4 (same lanes, same order,
+// same two-level simd_sum), so the scores match the separate product bit for bit; every threadgroup computes all
+// nr scores (nr <= 8, E*nr MACs) and then its own channels of the softmax-weighted sum
+kernel void kernel_mix_tail1_f32(
+        constant ggml_metal_kargs_mix_tail1 & args,
+        device const char * states,
+        device const char * query,
+        device       char * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr short NW  = 32;
+    constexpr short NSG = 4;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const short vg  = sgitg/NSG; // virtual threadgroup 0/1 (two rows each)
+    const short vsg = sgitg%NSG; // its simdgroup index
+
+    threadgroup float * red = shmem + vg*(2*NW); // 2 rows x 32 floats per virtual threadgroup
+    threadgroup float * sc  = shmem + 4*NW;      // the nr scores
+
+    const int nb = args.E/NB;
+
+    device const float4 * y4 = (device const float4 *) query;
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = vsg*NF + ix;
+
+    for (int pass = 0; pass < (args.nr + 3)/4; ++pass) {
+        const int r0 = (pass*2 + vg)*2;
+
+        float sumf[2] = { 0.f, 0.f };
+
+        if (r0 < args.nr) {
+            device const float4 * ax4[2];
+            ax4[0] = (device const float4 *) (states + (r0    )*args.nbs1);
+            ax4[1] = (device const float4 *) (states + (r0 + 1 < args.nr ? r0 + 1 : r0)*args.nbs1);
+
+            float4 yl4[NF4];
+            device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+            for (int ib = ib0; ib < nb; ib += NSG*NF) {
+                for (short i = 0; i < NF4; ++i) {
+                    yl4[i] = yb4[i];
+                }
+                for (short row = 0; row < 2; row++) {
+                    device const float4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+                    float sumq = 0.f;
+                    FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                        sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                    }
+
+                    sumf[row] += sumq;
+                }
+                yb4 += NSG*NF*NW/4;
+            }
+        }
+
+        // helper_mv_reduce_and_write<2> for this virtual threadgroup
+        for (short row = 0; row < 2; ++row) {
+            if (vsg == 0) {
+                red[NW*row + tiisg] = 0.0f;
+            }
+            sumf[row] = simd_sum(sumf[row]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short row = 0; row < 2; ++row) {
+            if (tiisg == 0) {
+                red[NW*row + vsg] = sumf[row];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short row = 0; row < 2; ++row) {
+            const float tot = simd_sum(red[NW*row + tiisg]);
+            if (tiisg == 0 && vsg == 0 && r0 + row < args.nr) {
+                sc[r0 + row] = tot;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // kernel_mix_tail_f32 for q = 0
+    const int e = tgpig.x*256 + tpitg;
+    if (e >= args.E) {
+        return;
+    }
+    float p[8];
+    float mx = -INFINITY;
+    for (int r = 0; r < args.nr; ++r) {
+        p[r] = sc[r]*args.scale;
+        mx = max(mx, p[r]);
+    }
+    float sum = 0.0f;
+    for (int r = 0; r < args.nr; ++r) {
+        p[r] = exp(p[r] - mx);
+        sum += p[r];
+    }
+    const float inv = 1.0f/sum;
+    float o = 0.0f;
+    for (int r = 0; r < args.nr; ++r) {
+        o += ((device const float *) (states + r*args.nbs1))[e] * (p[r]*inv);
+    }
+    ((device float *) dst)[e] = o;
+}
+
 // out = c * sigmoid(g), float4 lanes like the unfused unary/bin kernels
 kernel void kernel_gate_mul_f32(
         constant ggml_metal_kargs_gate_mul & args,
