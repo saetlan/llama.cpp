@@ -3567,6 +3567,11 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
 }
 
 static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool has_tensor) {
+    // hill-climb experiment: GGML_METAL_FA_NO_TENSOR=1 keeps the half8x8 kernel for prompt batches (rounding differs)
+    static const bool no_tensor = getenv("GGML_METAL_FA_NO_TENSOR") != nullptr;
+    if (no_tensor) {
+        return false;
+    }
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     if (!has_tensor || ggml_metal_op_flash_attn_ext_use_vec(op)) {
@@ -6421,9 +6426,8 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask),  5);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy),   6);
 
-    const int64_t total = (int64_t) args.NK*args.Ts*args.H*args.S;
     const int nth = 256;
-    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((total + nth - 1)/nth), 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.NK + nth - 1)/nth, args.Ts*args.H, args.S, nth, 1, 1);
 
     return 7;
 }
@@ -6484,9 +6488,8 @@ int ggml_metal_op_sconv_fused(ggml_metal_op_t ctx, int idx, int n) {
     if (args.T > 1) {
         // prompt batch: one thread per output (the rolling kernel would leave most of the GPU idle)
         ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_by_name(lib, "kernel_sconv_par_f32"));
-        const int64_t total = (int64_t) args.C*args.T*args.S;
         const int nth = 256;
-        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((total + nth - 1)/nth), 1, 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (args.C + nth - 1)/nth, args.T, args.S, nth, 1, 1);
         return n;
     }
 

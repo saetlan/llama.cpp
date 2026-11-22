@@ -551,17 +551,16 @@ kernel void kernel_sconv_par_f32(
         device       char * state,
         device       char * dst,
         device const char * resid,
-        uint tgpig [[threadgroup_position_in_grid]],
-        uint tpitg [[thread_position_in_threadgroup]],
-        uint ntg   [[threads_per_threadgroup]]) {
-    const int64_t i = (int64_t) tgpig*ntg + tpitg;
-    if (i >= (int64_t) args.C*args.T*args.S) {
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg   [[threads_per_threadgroup]]) {
+    // grid (channel blocks, tokens, sequences): no 64-bit division per thread
+    const int c = tgpig.x*ntg.x + tpitg.x;
+    const int t = tgpig.y;
+    const int s = tgpig.z;
+    if (c >= args.C) {
         return;
     }
-    const int c    = i % args.C;
-    const int64_t rest = i / args.C;
-    const int t    = rest % args.T;
-    const int s    = rest / args.T;
 
     device const float * p = (device const float *) (past + c*args.nbp1 + s*args.nbp2);
     float v[4];
@@ -757,20 +756,19 @@ kernel void kernel_relpos_mask_f32(
         device const char * relp,
         device const char * mask,
         device       half * dst,
-        uint tgpig [[threadgroup_position_in_grid]],
-        uint tpitg [[thread_position_in_threadgroup]],
-        uint ntg   [[threads_per_threadgroup]]) {
-    const int64_t i = (int64_t) tgpig*ntg + tpitg;
-    const int64_t n = (int64_t) args.NK*args.Ts*args.H*args.S;
-    if (i >= n) {
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg   [[threads_per_threadgroup]]) {
+    // grid (kv blocks, token x head, sequence): no 64-bit division per thread
+    const int kv = tgpig.x*ntg.x + tpitg.x;
+    if (kv >= args.NK) {
         return;
     }
-    const int kv   = i % args.NK;
-    int64_t   rest = i / args.NK;
-    const int t    = rest % args.Ts; rest /= args.Ts;
-    const int h    = rest % args.H;
-    const int s    = rest / args.H;
-    const int tok  = s*args.Ts + t;
+    const int t   = tgpig.y % args.Ts;
+    const int h   = tgpig.y / args.Ts;
+    const int s   = tgpig.z;
+    const int tok = s*args.Ts + t;
+    const int64_t i = kv + (int64_t) args.NK*(t + (int64_t) args.Ts*(h + (int64_t) args.H*s));
 
     const int rp = ((device const int32_t *) (relp + tok*args.nbp1))[kv];
 
