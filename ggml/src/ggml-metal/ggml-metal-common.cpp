@@ -46,7 +46,9 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
+    // hill-climb: GGML_METAL_MMID_MIN_T overrides the token count from which the mm_id path is used (default 32)
+    static const int64_t min_t = getenv("GGML_METAL_MMID_MIN_T") ? atoll(getenv("GGML_METAL_MMID_MIN_T")) : 32;
+    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= min_t;
 }
 
 // the most src1 rows of the few-row MMA kernels
