@@ -21,28 +21,48 @@ The work was AI-assisted (Claude Code), and every change was measured on this ma
 
 ## Results
 
-One session on 23 Nov 2026, with the three setups run in the order A B C C B A. Settings: llama-server, 131k
-context, 2 slots, flash attention on; medians of 6 decode samples. Each cell is pass 1 / pass 2:
+One session on 23 Nov 2026, with the three setups run in the order A B C C B A, so each ran twice. Settings:
+llama-server, 131k context, 2 slots, flash attention on. Each pass takes the median of 6 decode samples.
 
-| | stock `418fe97` + Q8_0 | this branch, exact (default) | this branch, fast (opt-in) |
+Each cell is the mean of the two passes ± half the gap between them. With two passes, that is the standard error
+of the mean:
+
+| t/s | stock `418fe97` + Q8_0 | this branch, exact (default) | this branch, fast (opt-in) |
 |---|---|---|---|
-| decode, 1 user | 28.4 / 28.6 t/s | 45.8 / **48.2** | 48.0 / 48.3 |
-| decode, 2 users (total) | 39.4 / 40.1 | 60.6 / **66.7** | 60.5 / 66.2 |
-| prefill, 3.3k-token prompt | 372 / 383 t/s | 900 / **1041** | 997 / 1039 |
-| prefill, 12.9k-token prompt | 303 / 308 t/s | 953 / **977** | 990 / 1010 |
+| decode, 1 user | 28.5 ± 0.1 | **47.0 ± 1.2** | 48.1 ± 0.2 |
+| decode, 2 users (total) | 39.7 ± 0.3 | **63.7 ± 3.0** | 63.4 ± 2.9 |
+| prefill, 3.3k-token prompt | 378 ± 6 | **971 ± 70** | 1018 ± 21 |
+| prefill, 12.9k-token prompt | 306 ± 2 | **965 ± 12** | 1000 ± 10 |
 
-On the second pass the exact build against stock gives:
+Against stock, with the uncertainty of both sides carried into the ratio:
 
-- decode +68% (1 user) and +67% (2 users);
-- prefill ×2.7 at 3.3k tokens and ×3.2 at 12.9k tokens.
+| | exact vs stock | fast vs stock |
+|---|---|---|
+| decode, 1 user | **+65% ± 4%** | +69% ± 1% |
+| decode, 2 users | **+60% ± 8%** | +60% ± 7% |
+| prefill, 3.3k-token prompt | **×2.57 ± 0.19** | ×2.70 ± 0.07 |
+| prefill, 12.9k-token prompt | **×3.16 ± 0.05** | ×3.27 ± 0.04 |
 
-The first pass of the branch builds ran while the machine was busier, so the decode samples drifted down during
-that run.
+- Two passes give only a rough spread.
+- The branch builds varied more than stock, because their first pass ran while the machine was busier. Exact prefill
+  on the 3.3k-token prompt was 900 t/s on pass 1 and 1041 t/s on pass 2.
+- Fast against exact: only the 12.9k-token prefill gain (+3.7% ± 1.6%) is larger than the noise in this run.
+
+<details><summary>Raw values (pass 1 / pass 2)</summary>
+
+| t/s | stock + Q8_0 | exact | fast |
+|---|---|---|---|
+| decode, 1 user | 28.4 / 28.6 | 45.8 / 48.2 | 48.0 / 48.3 |
+| decode, 2 users (total) | 39.4 / 40.1 | 60.6 / 66.7 | 60.5 / 66.2 |
+| prefill, 3.3k-token prompt | 372 / 383 | 900 / 1041 | 997 / 1039 |
+| prefill, 12.9k-token prompt | 303 / 308 | 953 / 977 | 990 / 1010 |
+
+</details>
 
 Other measurements of the exact build:
 
-- llama-bench pp512 is 1183 t/s.
-- A 119k-token needle prompt prefills at 544 t/s, against 174 t/s for the day-1 build.
+- llama-bench pp512 is 1183 t/s (separate run, different harness).
+- A 119k-token needle prompt (separate run) prefills at 544 t/s, against 174 t/s for the day-1 build.
 
 These numbers don't include speculative decoding. With `--spec-type ngram-mod` (lossless), file edits and rewrites
 run at 78–137 t/s.
@@ -85,7 +105,7 @@ differences into visible greedy divergence.
 The fast column is opt-in and changes rounding: `-ub 1024 --cache-ram 4096` plus `GGML_METAL_MMID_MIN_T=6`.
 
 - KLD against the exact path is 0.0002.
-- Prefill: +3% at 12.9k tokens in the table above, and +7% in llama-bench pp4096.
+- Prefill: +3.7% ± 1.6% at 12.9k tokens in the table above, and +7% in llama-bench pp4096.
 - Follow-up prompts of 6–31 tokens run 12–64% faster.
 - GPU peak is 46 GiB instead of 35 GiB.
 
