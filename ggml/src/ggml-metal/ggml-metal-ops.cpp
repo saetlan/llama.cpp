@@ -6277,7 +6277,8 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
     {
         const int64_t Ep = bias->ne[1];
         const int     HG = 4;
-        const int     CH = 4096;
+        // prompt batches have enough (token, head group) threadgroups: one kv chunk each, so the table is built once
+        const int     CH = (int64_t) args.Ts*args.S >= 64 ? std::max<int>(4096, args.NK) : 4096;
         const size_t  smem = (size_t) HG*Ep*sizeof(float);
         if (((int64_t) args.Ts*args.S > 1 || args.NK >= 16384) && smem <= 32768 && getenv("GGML_METAL_RELPOS2_DISABLE") == nullptr) {
             ggml_metal_kargs_relpos2 a2 = {};
@@ -6286,7 +6287,13 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
             a2.HG = HG;
             a2.CH = CH;
 
-            auto pipeline2 = ggml_metal_library_get_pipeline_by_name(lib, "kernel_relpos_mask2_f32");
+            // NR = 16, aligned rows: the register-table variant with vector gathers
+            static const bool relpos3_off = getenv("GGML_METAL_RELPOS3_DISABLE") != nullptr;
+            const bool use3 = !relpos3_off && args.NR == 16 && args.NK % 4 == 0 && relp->nb[1] % 16 == 0 && relp->nb[0] == 4 &&
+                (args.mne1 == 1 || mask->nb[1] % 16 == 0) && (args.mne3 == 1 || mask->nb[3] % 16 == 0) && mask->nb[0] == 4 &&
+                ggml_is_contiguous(cpy) && (uintptr_t) relp->data % 16 == 0 && (uintptr_t) mask->data % 16 == 0 &&
+                (uintptr_t) cpy->data % 8 == 0;
+            auto pipeline2 = ggml_metal_library_get_pipeline_by_name(lib, use3 ? "kernel_relpos_mask3_f32" : "kernel_relpos_mask2_f32");
 
             ggml_metal_encoder_set_pipeline(enc, pipeline2);
             ggml_metal_encoder_set_bytes   (enc, &a2, sizeof(a2), 0);

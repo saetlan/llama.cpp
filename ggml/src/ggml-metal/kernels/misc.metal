@@ -833,6 +833,81 @@ kernel void kernel_relpos_mask2_f32(
     }
 }
 
+// kernel_relpos_mask2_f32 with NR = 16: each thread keeps the R rows of the head group in registers and computes the
+// table entries of one bucket for all heads of the group from one load of its bias row (same per-head dot order, so
+// the same table values); the gather then handles 4 kv cells per thread with float4/int4 loads and half4 stores
+// (requires NK % 4 == 0)
+kernel void kernel_relpos_mask3_f32(
+        constant ggml_metal_kargs_relpos2 & a2,
+        device const char * bias,
+        device const char * R,
+        device const char * sinks,
+        device const char * relp,
+        device const char * mask,
+        device       half * dst,
+        threadgroup  float * tbl [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    constant ggml_metal_kargs_relpos & args = a2.r;
+    constexpr int NR = 16;
+    constexpr int HGM = 4;
+
+    const int nth = ntg.x;
+    const int h0  = tgpig.y*HGM;
+    const int tok = tgpig.z;
+    const int t   = tok % args.Ts;
+    const int s   = tok / args.Ts;
+    const int nhg = min(HGM, args.H - h0);
+
+    float r[HGM][NR];
+    float sk[HGM];
+    for (int hh = 0; hh < HGM; ++hh) {
+        const int h = min(h0 + hh, args.H - 1);
+        device const float * rr = (device const float *) (R + h*args.nbR1 + tok*args.nbR2);
+        for (int k = 0; k < NR; ++k) {
+            r[hh][k] = rr[k];
+        }
+        sk[hh] = ((device const float *) (sinks + tok*args.nbs1))[h];
+    }
+
+    for (int rp = tpitg; rp < a2.Ep; rp += nth) {
+        device const float * b = (device const float *) (bias + rp*args.nbb1);
+        float bk[NR];
+        for (int k = 0; k < NR; ++k) {
+            bk[k] = b[k];
+        }
+        for (int hh = 0; hh < HGM; ++hh) {
+            if (hh < nhg) {
+                float v = 0.0f;
+                for (int k = 0; k < NR; ++k) {
+                    v = fma(bk[k], r[hh][k], v);
+                }
+                v = v - sk[hh];
+                tbl[hh*a2.Ep + rp] = v;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const int4   * rprow = (device const int4   *) (relp + tok*args.nbp1);
+    device const float4 * mrow  = (device const float4 *) (mask + (args.mne1 == 1 ? 0 : t)*args.nbm1 + (args.mne3 == 1 ? 0 : s)*args.nbm3);
+
+    const int kv0 = tgpig.x*a2.CH;
+    const int kv1 = min(kv0 + a2.CH, args.NK);
+
+    for (int kv = kv0 + 4*tpitg; kv < kv1; kv += 4*nth) {
+        const int4   rp = rprow[kv/4];
+        const float4 m  = mrow[kv/4];
+        for (int hh = 0; hh < nhg; ++hh) {
+            threadgroup const float * tb = tbl + hh*a2.Ep;
+            const int64_t i = kv + (int64_t) args.NK*(t + (int64_t) args.Ts*(h0 + hh + (int64_t) args.H*s));
+            *((device half4 *) (dst + i)) = half4((half) (tb[rp.x] + m.x), (half) (tb[rp.y] + m.y), (half) (tb[rp.z] + m.z), (half) (tb[rp.w] + m.w));
+        }
+    }
+}
+
 // softmax over the nr scores of query q, then out[e] = sum_r p_r * states[e, r]; one thread per channel
 kernel void kernel_mix_tail_f32(
         constant ggml_metal_kargs_mix_tail & args,
