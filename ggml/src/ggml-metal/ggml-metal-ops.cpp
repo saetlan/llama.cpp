@@ -582,6 +582,10 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_sconv_dyn_fused(ctx, idx, n);
         }
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CAT_MV && getenv("GGML_METAL_CAT_MV_DISABLE") == nullptr) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_cat_mv_fused(ctx, idx);
+        }
     }
 
     ggml_tensor * op = ctx->node(idx);
@@ -5596,6 +5600,45 @@ int ggml_metal_op_mix_tail_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, (args.E + nth - 1)/nth, mm2->ne[1], 1, nth, 1, 1);
 
     return 4;
+}
+
+// control input: concat + F32 matvec at one token without the concat; idx is the CONCAT
+int ggml_metal_op_cat_mv_fused(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * cat = ctx->node(idx);
+    ggml_tensor       * mm  = ctx->node(idx + 1);
+    const ggml_tensor * a   = cat->src[0];
+    const ggml_tensor * b   = cat->src[1];
+    const ggml_tensor * w   = mm->src[0];
+
+    for (int i = 0; i < 2; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_cat_mv args = {};
+    args.ne00 = (int32_t) w->ne[0];
+    args.ne01 = (int32_t) w->ne[1];
+    args.Na   = (int32_t) a->ne[0];
+    args.nb01 = w->nb[1];
+
+    auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, "kernel_cat_mv_f32");
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm), 4);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float)*2, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne01 + 1)/2, 1, 1, 32, 4, 1);
+
+    return 2;
 }
 
 // depth-mix states: rms_norm + concat onto the block stack; idx is the RMS_NORM, the CONCAT is idx + 1

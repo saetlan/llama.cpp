@@ -1170,6 +1170,57 @@ static bool ggml_metal_fusion_check_norm_concat(
     return true;
 }
 
+// out = W^T [a; b] at one token, W F32 on the kernel_mul_mv_f32_f32_4 path (nsg 4, nr0 2): replicated exactly with the
+// vector read from a and b; requires the a|b boundary on a 16-float chunk boundary
+static bool ggml_metal_fusion_check_cat_mv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * cat = nodes[0];
+    const ggml_tensor * mm  = nodes[1];
+    if (mm->src[1] != cat || ggml_get_op_params_i32(cat, 0) != 0) {
+        return false;
+    }
+    const ggml_tensor * a = cat->src[0];
+    const ggml_tensor * b = cat->src[1];
+    const ggml_tensor * w = mm->src[0];
+    if (!a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || cat->type != GGML_TYPE_F32 ||
+        w->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        cat->ne[1] != 1 || cat->ne[2] != 1 || cat->ne[3] != 1 || ggml_nelements(a) != a->ne[0] || ggml_nelements(b) != b->ne[0] ||
+        a->ne[0] % 16 != 0 || b->ne[0] % 16 != 0 || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) ||
+        w->ne[0] != cat->ne[0] || w->ne[0] < 512 || w->ne[0] % 32 != 0 || w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != sizeof(float) ||
+        w->nb[1] % 16 != 0 || mm->ne[0] != w->ne[1] || mm->ne[1] != 1 || mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    if ((((uintptr_t) a->data) % 16) != 0 || (((uintptr_t) b->data) % 16) != 0) {
+        if (mode == GGML_METAL_FUSION_FULL) {
+            return false;
+        }
+    }
+    if (cat->flags & GGML_TENSOR_FLAG_OUTPUT || ggml_node_get_use_count(gf, node_idxs[idx]) != 1) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+            if (!x->data || !y->data) {
+                return false;
+            }
+            const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
+            const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
+            return x0 < y1 && y0 < x1;
+        };
+        if (overlap(mm, root(a)) || overlap(mm, root(b))) {
+            return false;
+        }
+    }
+    GGML_UNUSED(fusion);
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1727,6 +1778,7 @@ static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAP
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_cat_mv          = { GGML_OP_CONCAT, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_norm_concat     = { GGML_OP_RMS_NORM, GGML_OP_CONCAT };
 static const std::vector<ggml_op> ops_norm_concat_r   = { GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_CONCAT };
 static const std::vector<ggml_op> ops_mv_id_scale     = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_MUL };
@@ -1801,6 +1853,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
+    { GGML_METAL_FUSION_CAT_MV,      ops_cat_mv,        {}, true, ggml_metal_fusion_check_cat_mv },
     { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat,   {}, true, ggml_metal_fusion_check_norm_concat },
     { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat_r, {}, true, ggml_metal_fusion_check_norm_concat },
     { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale,     {}, true, ggml_metal_fusion_check_mv_id_scale },

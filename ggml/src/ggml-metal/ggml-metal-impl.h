@@ -813,6 +813,13 @@ typedef struct {
 } ggml_metal_kargs_mix_tail1;
 
 typedef struct {
+    int32_t  ne00;  // vector length (Na + Nb)
+    int32_t  ne01;  // output rows
+    int32_t  Na;    // elements taken from a
+    uint64_t nb01;  // weight row stride
+} ggml_metal_kargs_cat_mv;
+
+typedef struct {
     int32_t  NR;    // relative features
     int32_t  H;
     int32_t  NK;    // kv cells

@@ -3148,6 +3148,68 @@ kernel void kernel_mul_mv_mxfp4_f32(
 
 // NVFP4: blocks of 64 values = 4 sub-blocks of 16 with a UE4M3 scale each, 36 bytes (word aligned).
 // 4 threads per block, one sub-block each (8 quant bytes = two words); 8 blocks per simdgroup step
+// kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2> with NSG = 4 and the vector [a; b] read from its two parts:
+// the 16-float lane chunks start at multiples of 16, so with Na % 16 == 0 each chunk lies in a or in b
+kernel void kernel_cat_mv_f32(
+        constant ggml_metal_kargs_cat_mv & args,
+        device const char * src0,
+        device const char * a,
+        device const char * b,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr short NSG = 4;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x*NR0;
+
+    device const float4 * ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax4[row] = (device const float4 *) (src0 + (uint64_t) min(r0 + row, args.ne01 - 1)*args.nb01);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    float4 yl4[NF4];
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        const int off = ib*NB + il*NF;
+        device const float4 * yb4 = off < args.Na
+            ? (device const float4 *) a + off/4
+            : (device const float4 *) b + (off - args.Na)/4;
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const float4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+            }
+
+            sumf[row] += sumq;
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 template<int NR0, typename args_t>
 void kernel_mul_mv_nvfp4_f32_impl_post(
         args_t args,
