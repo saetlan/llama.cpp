@@ -197,7 +197,46 @@ static bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
     return true;
 }
 
+// hill-climb (opt-in, GGML_METAL_MEMRANGE_VIEWS=1): view-extent ranges and half-open overlap; measured within noise
+static bool ggml_mem_range_legacy() {
+    static const bool legacy = getenv("GGML_METAL_MEMRANGE_VIEWS") == nullptr;
+    return legacy;
+}
+
 static ggml_mem_range ggml_mem_range_from_tensor(const ggml_tensor * tensor, ggml_mem_range_type pt) {
+    // hill-climb: an allocated view covers [data, data + extent) of its base: the bytes its elements can touch
+    // (a superset for any strides), so disjoint views of one buffer no longer look like they overlap
+    if (!ggml_mem_range_legacy() && tensor->view_src && tensor->view_src->buffer && tensor->data) {
+        int64_t extent = ggml_type_size(tensor->type);
+        bool ok = true;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (tensor->ne[i] <= 0) {
+                ok = false;
+                break;
+            }
+            extent += (tensor->ne[i] - 1)*(int64_t) tensor->nb[i];
+        }
+        if (ggml_is_quantized(tensor->type)) {
+            ok = false; // block rows: keep the base range
+        }
+        if (ok && extent > 0) {
+            const ggml_tensor * base = tensor->view_src;
+            const uint64_t b0 = (uint64_t) base->data;
+            const uint64_t b1 = b0 + ggml_backend_buft_get_alloc_size(base->buffer->buft, base);
+            uint64_t p0 = (uint64_t) tensor->data;
+            uint64_t p1 = p0 + (uint64_t) extent;
+            if (p0 >= b0 && p1 <= b1) {
+                ggml_mem_range mr = {
+                    /*.pb =*/ (uint64_t) base->buffer,
+                    /*.p0 =*/ p0,
+                    /*.p1 =*/ p1,
+                    /*.pt =*/ pt,
+                };
+                return mr;
+            }
+        }
+    }
+
     // always use the base tensor
     tensor = tensor->view_src ? tensor->view_src : tensor;
 
@@ -287,7 +326,8 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
             continue;
         }
 
-        if (mr.p0 < cmp.p1 && mr.p1 >= cmp.p0) {
+        // half-open ranges: touching is not overlapping (the legacy test also counted mr.p1 == cmp.p0)
+        if (mr.p0 < cmp.p1 && (ggml_mem_range_legacy() ? mr.p1 >= cmp.p0 : mr.p1 > cmp.p0)) {
             if (mrs->debug > 2) {
                 GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
                         __func__,
@@ -323,6 +363,11 @@ static bool ggml_mem_ranges_check_dst(ggml_mem_ranges_t mrs, const ggml_tensor *
 
     return res;
 }
+
+bool ggml_mem_ranges_check_read (ggml_mem_ranges_t mrs, const ggml_tensor * tensor) { return ggml_mem_ranges_check_src(mrs, tensor); }
+bool ggml_mem_ranges_check_write(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) { return ggml_mem_ranges_check_dst(mrs, tensor); }
+bool ggml_mem_ranges_add_read   (ggml_mem_ranges_t mrs, const ggml_tensor * tensor) { return ggml_mem_ranges_add_src(mrs, tensor); }
+bool ggml_mem_ranges_add_write  (ggml_mem_ranges_t mrs, const ggml_tensor * tensor) { return ggml_mem_ranges_add_dst(mrs, tensor); }
 
 bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {

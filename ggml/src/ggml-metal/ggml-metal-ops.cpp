@@ -114,6 +114,79 @@ struct ggml_metal_op {
 
     int debug_graph;
 
+    // hill-climb: group-aware ranges of the fused group being encoded (see group_ranges)
+    bool group_mode = false;
+    int  group_n    = 0;
+    std::vector<const ggml_tensor *> g_reads;
+    std::vector<const ggml_tensor *> g_writes;
+
+    // the tensors a single-kernel fused group of n nodes at idx really reads (srcs from outside the group) and writes
+    // (its last node, outputs, nodes used outside the group directly or through a view, and writes into views)
+    bool group_ranges(int idx, int n) {
+        g_reads.clear();
+        g_writes.clear();
+        const int r0 = idxs[idx];
+        const int r1 = idxs[idx + n - 1];
+        if (r1 < r0 || r1 - r0 > 64) {
+            return false;
+        }
+        auto in_range = [&](const ggml_tensor * t) -> bool {
+            for (int r = r0; r <= r1; ++r) {
+                if (gf->nodes[r] == t) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto internal = [&](const ggml_tensor * t) -> bool {
+            if (!in_range(t)) {
+                return false;
+            }
+            return !ggml_op_is_empty(t->op) || in_range(root(t));
+        };
+        auto users_in = [&](const ggml_tensor * t) -> int {
+            int k = 0;
+            for (int q = r0; q <= r1; ++q) {
+                const ggml_tensor * u = gf->nodes[q];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    k += u->src[s] == t;
+                }
+            }
+            return k;
+        };
+        for (int r = r0; r <= r1; ++r) {
+            const ggml_tensor * t = gf->nodes[r];
+            if (ggml_op_is_empty(t->op)) {
+                continue;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = t->src[s];
+                if (src && !internal(src)) {
+                    g_reads.push_back(src);
+                }
+            }
+        }
+        for (int r = r0; r <= r1; ++r) {
+            const ggml_tensor * t = gf->nodes[r];
+            if (ggml_op_is_empty(t->op)) {
+                continue;
+            }
+            bool w = r == r1 || (t->flags & GGML_TENSOR_FLAG_OUTPUT) || t->view_src != nullptr ||
+                     ggml_node_get_use_count(gf, r) != users_in(t);
+            for (int q = r0; q <= r1 && !w; ++q) {
+                const ggml_tensor * v = gf->nodes[q];
+                if (ggml_op_is_empty(v->op) && root(v) == t && ggml_node_get_use_count(gf, q) != users_in(v)) {
+                    w = true;
+                }
+            }
+            if (w) {
+                g_writes.push_back(t);
+            }
+        }
+        return true;
+    }
+
 private:
     ggml_cgraph * gf;
 
@@ -173,6 +246,11 @@ static bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, const ggml_tens
         return false;
     }
 
+    // the group's ranges were checked as a whole before its encoder ran
+    if (ctx->group_mode) {
+        return true;
+    }
+
     return ggml_mem_ranges_check(ctx->mem_ranges, node);
 }
 
@@ -182,6 +260,39 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     }
 
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
+}
+
+// hill-climb (opt-in, GGML_METAL_GROUP_RANGES=1): fusions whose encoder always runs one kernel that writes only the
+// group's last node, nodes used outside the group, views it stores into (and NORM_CONCAT's normed row) get
+// group-aware ranges. ~6% fewer barriers but only ~+0.3% decode, and a missed write is a race, so it is off by default
+static bool ggml_metal_op_group_safe(const ggml_metal_fusion * fusion) {
+    static const bool disabled = getenv("GGML_METAL_GROUP_RANGES") == nullptr;
+    if (disabled) {
+        return false;
+    }
+    switch (ggml_metal_fusion_get_id(fusion)) {
+        case GGML_METAL_FUSION_NORM_MUL:
+        case GGML_METAL_FUSION_NORM_MUL_ADD:
+        case GGML_METAL_FUSION_MOE_REDUCE:
+        case GGML_METAL_FUSION_SITU:
+        case GGML_METAL_FUSION_CLIP_ROWS:
+        case GGML_METAL_FUSION_CLIP_STORE:
+        case GGML_METAL_FUSION_NORM_STORE:
+        case GGML_METAL_FUSION_CTRL_MIX:
+        case GGML_METAL_FUSION_SCONV:
+        case GGML_METAL_FUSION_SCONV_DYN:
+        case GGML_METAL_FUSION_RELPOS:
+        case GGML_METAL_FUSION_GATE_MUL:
+        case GGML_METAL_FUSION_MV_ID_SCALE:
+        case GGML_METAL_FUSION_NORM_CONCAT:
+            return true;
+        case GGML_METAL_FUSION_CAT_MV:
+            return getenv("GGML_METAL_CAT_MV_DISABLE") == nullptr;
+        case GGML_METAL_FUSION_GF_CTRL:
+            return getenv("GGML_METAL_GF_CTRL_DISABLE") == nullptr;
+        default:
+            return false;
+    }
 }
 
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -230,19 +341,43 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     // otherwise, we add the new ranges to the encoding context and process the node concurrently
     //
     {
-        bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
+        bool is_concurrent = false;
 
-        if (is_concurrent && ctx->use_fusion()) {
-            int n_fuse = 1;
-            const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_fuse);
-            if (fusion) {
-                // fused kernels write to the last node of the group, not necessarily to the first node's dst
-                is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + n_fuse - 1));
+        ctx->group_mode = false;
+        int gn = 1;
+        const ggml_metal_fusion * gfu = ctx->use_fusion() ? ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &gn) : nullptr;
+        if (ctx->mem_ranges) {
+            if (gfu && gn > 1 && ggml_metal_op_group_safe(gfu) && ctx->group_ranges(idx, gn)) {
+                // kernels that also write an inner node whatever its users: NORM_CONCAT always stores the normed row
+                if (ggml_metal_fusion_get_id(gfu) == GGML_METAL_FUSION_NORM_CONCAT) {
+                    ctx->g_writes.push_back(ctx->node(idx));
+                }
+                is_concurrent = true;
+                for (const ggml_tensor * t : ctx->g_reads) {
+                    is_concurrent = is_concurrent && ggml_mem_ranges_check_read(ctx->mem_ranges, t);
+                }
+                for (const ggml_tensor * t : ctx->g_writes) {
+                    is_concurrent = is_concurrent && ggml_mem_ranges_check_write(ctx->mem_ranges, t);
+                }
+                if (!is_concurrent) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
+                ctx->group_mode = true;
+                ctx->group_n    = gn;
             }
         }
 
-        if (!is_concurrent) {
-            ggml_metal_op_concurrency_reset(ctx);
+        if (!ctx->group_mode) {
+            is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
+
+            if (is_concurrent && gfu) {
+                // fused kernels write to the last node of the group, not necessarily to the first node's dst
+                is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + gn - 1));
+            }
+
+            if (!is_concurrent) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
         }
 
         if (ctx->debug_graph > 0) {
@@ -543,9 +678,24 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     // update the mem ranges in the encoding context
-    for (int i = 0; i < n_fuse; ++i) {
-        if (!ggml_metal_op_concurrency_add(ctx, ctx->node(idx + i))) {
-            ggml_metal_op_concurrency_reset(ctx);
+    if (ctx->group_mode) {
+        if (n_fuse != ctx->group_n) {
+            GGML_ABORT("group ranges: encoder consumed %d nodes, the fused group has %d", n_fuse, ctx->group_n);
+        }
+        ctx->group_mode = false;
+        if (ctx->mem_ranges) {
+            for (const ggml_tensor * t : ctx->g_reads) {
+                ggml_mem_ranges_add_read(ctx->mem_ranges, t);
+            }
+            for (const ggml_tensor * t : ctx->g_writes) {
+                ggml_mem_ranges_add_write(ctx->mem_ranges, t);
+            }
+        }
+    } else {
+        for (int i = 0; i < n_fuse; ++i) {
+            if (!ggml_metal_op_concurrency_add(ctx, ctx->node(idx + i))) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
         }
     }
 
