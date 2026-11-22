@@ -2185,6 +2185,29 @@ void ggml_metal_fusion_add_alloc_deps(
             i += best_raw - 1;
         }
     }
+
+    // inkling2 mix() for a token batch: before the reorder the queries REPEAT sits between the CONT and the scores
+    // product, so no raw pattern matches. The MIX_TAIL token-batch kernel reads the states and the scores while
+    // writing the output, so keep both alive until the output (found by structure, independent of node order).
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * mm2 = gf->nodes[i];
+        if (mm2->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        ggml_tensor * cont = mm2->src[0];
+        ggml_tensor * sm   = mm2->src[1];
+        if (cont == nullptr || sm == nullptr || cont->op != GGML_OP_CONT || sm->op != GGML_OP_SOFT_MAX || sm->src[1] != nullptr) {
+            continue;
+        }
+        ggml_tensor * tr  = cont->src[0];
+        ggml_tensor * mm1 = sm->src[0];
+        if (tr == nullptr || mm1 == nullptr || tr->op != GGML_OP_TRANSPOSE || mm1->op != GGML_OP_MUL_MAT ||
+            mm1->src[0] != tr->src[0] || tr->src[0]->ne[2] < 2) {
+            continue;
+        }
+        add_alloc_dep(user_data, tr->src[0], mm2);
+        add_alloc_dep(user_data, mm1, mm2);
+    }
 }
 
 // ---- shared fusion info ---------------------------------------------------

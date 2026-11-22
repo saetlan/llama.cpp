@@ -260,6 +260,11 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * queries = n_tokens == 1 && query->type == GGML_TYPE_F32
         ? ggml_reshape_3d(ctx0, query, n_embd, query->ne[1], 1)
         : ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    if (queries->op == GGML_OP_REPEAT) {
+        // the repeat goes in first, so the transposed copy, the two products and the softmax stay one raw run
+        // (Metal fuses it; the graph optimizer keeps recognised runs together)
+        ggml_build_forward_expand(gf, queries);
+    }
 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
