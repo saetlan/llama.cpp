@@ -3149,7 +3149,7 @@ kernel void kernel_mul_mv_mxfp4_f32(
 // NVFP4: blocks of 64 values = 4 sub-blocks of 16 with a UE4M3 scale each, 36 bytes (word aligned).
 // 4 threads per block, one sub-block each (8 quant bytes = two words); 8 blocks per simdgroup step
 template<int NR0, typename args_t>
-void kernel_mul_mv_nvfp4_f32_impl(
+void kernel_mul_mv_nvfp4_f32_impl_post(
         args_t args,
         device const char * src0,
         device const char * src1,
@@ -3157,7 +3157,8 @@ void kernel_mul_mv_nvfp4_f32_impl(
         threadgroup  char * shmem,
         uint3  tgpig,
         ushort tiisg,
-        ushort sgitg) {
+        ushort sgitg,
+        float  post) {
     const short NSG = FC_mul_mv_nsg;
 
     const int r0 = tgpig.x;
@@ -3220,9 +3221,22 @@ void kernel_mul_mv_nvfp4_f32_impl(
     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
+            dst_f32[first_row + row] = sum_all*post;
         }
     }
+}
+
+template<int NR0, typename args_t>
+void kernel_mul_mv_nvfp4_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    kernel_mul_mv_nvfp4_f32_impl_post<NR0, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, 1.0f);
 }
 
 template<int nr0, typename args_t>
@@ -3492,6 +3506,70 @@ template [[host_name("kernel_mul_mv_id_q5_1_f32")]]    kernel kernel_mul_mv_id_t
 
 template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4>>>;
 template [[host_name("kernel_mul_mv_id_nvfp4_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_nvfp4_f32_impl<N_R0_NVFP4>>>;
+
+// kernel_mul_mv_id for NVFP4 with the per-expert scale of the weight applied to each output row (x*scale[expert])
+kernel void kernel_mul_mv_id_nvfp4s_f32(
+        constant ggml_metal_kargs_mul_mv_id & args,
+        device const char  * src0s,
+        device const char  * src1,
+        device       char  * dst,
+        device const char  * ids,
+        device const float * scale,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const int iid1 = tgpig.z/args.nei0;
+    const int idx  = tgpig.z%args.nei0;
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device char * dst_cur = dst + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
+
+    if (i02 == -1) {
+        device float * dst_f32 = (device float *) dst_cur;
+        const ushort nth = ntg.x*ntg.y*ntg.z;
+        for (int i0 = tiitg; i0 < args.ne0; i0 += nth) {
+            dst_f32[i0] = 0.0f;
+        }
+        return;
+    }
+
+    device const char * src0_cur = src0s + i02*args.nb02;
+    device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
+
+    ggml_metal_kargs_mul_mv args0 = {
+        /*.ne00 =*/ args.ne00,
+        /*.ne01 =*/ args.ne01,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ args.nb00,
+        /*.nb01 =*/ args.nb01,
+        /*.nb02 =*/ args.nb02,
+        /*.nb03 =*/ args.nb02,
+        /*.ne10 =*/ args.ne10,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ args.nb10,
+        /*.nb11 =*/ args.nb11,
+        /*.nb12 =*/ args.nb12,
+        /*.nb13 =*/ args.nb12,
+        /*.ne0  =*/ args.ne0,
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ args.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    kernel_mul_mv_nvfp4_f32_impl_post<N_R0_NVFP4, thread const ggml_metal_kargs_mul_mv &>(
+        args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg, scale[i02]);
+}
 
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;

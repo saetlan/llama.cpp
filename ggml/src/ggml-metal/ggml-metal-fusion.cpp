@@ -1054,6 +1054,68 @@ static bool ggml_metal_fusion_check_norm_store(
     return ggml_metal_fusion_check_store_tail(nrm, nodes[1], gf, r0, r1);
 }
 
+// res*scale[ids] after an NVFP4 MUL_MAT_ID on the matvec path (llm_graph_context::build_lora_mm_id with w_s):
+// nodes = MUL_MAT_ID, [REPEAT], GET_ROWS, MUL; the scale is read straight from w_s by expert id in the kernel
+static bool ggml_metal_fusion_check_mv_id_scale(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n = (int) fusion->ops.size(); // 3 or 4
+    const ggml_tensor * mm  = nodes[0];
+    const ggml_tensor * gr  = nodes[n - 2];
+    const ggml_tensor * mul = nodes[n - 1];
+    const ggml_tensor * ids = mm->src[2];
+
+    if (mm->src[0]->type != GGML_TYPE_NVFP4 || mm->src[1]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        ggml_metal_op_mul_mat_id_use_mm(mm, true) || !ggml_is_contiguous(mm) || mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (gr->src[1] != ids || mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, mm) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    if (!((mul->src[0] == mm && mul->src[1] == gr) || (mul->src[0] == gr && mul->src[1] == mm))) {
+        return false;
+    }
+    // the scale vector: GET_ROWS reads RESHAPE(w_s) directly, or through REPEAT at more than one token
+    const ggml_tensor * sv = gr->src[0];
+    if (n == 4) {
+        const ggml_tensor * rp = nodes[1];
+        if (sv != rp || rp->op != GGML_OP_REPEAT) {
+            return false;
+        }
+        sv = rp->src[0];
+    }
+    if (sv->op != GGML_OP_RESHAPE || sv->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) ||
+        ggml_nelements(sv) != mm->src[0]->ne[2] || sv->ne[0] != 1) {
+        return false;
+    }
+    for (int i = 0; i < n - 1; ++i) { // only the MUL leaves the group
+        if (ggml_node_get_use_count(gf, node_idxs[idx + i]) != 1) {
+            return false;
+        }
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // mul is written while the activation and the ids are read
+        if (overlap(mul, root(mm->src[1])) || overlap(mul, root(ids))) {
+            return false;
+        }
+    }
+    GGML_UNUSED(gf);
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -1611,6 +1673,8 @@ static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAP
                                                  GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
 static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
 static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_mv_id_scale     = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_mv_id_scale_rep = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
 // raw: CONCAT VIEW VIEW CPY SSM_CONV RESHAPE, lag 0 (window VIEW TRANSPOSE CONT RESHAPE, RESHAPE of the projection, tap VIEW,
 // MUL RESHAPE ADD), lags 1-3 (the projection reshape is visited already), ADD SCALE
 static const std::vector<ggml_op> ops_sconv_dyn = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE,
@@ -1681,6 +1745,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
     { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
     { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
+    { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale,     {}, true, ggml_metal_fusion_check_mv_id_scale },
+    { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale_rep, {}, true, ggml_metal_fusion_check_mv_id_scale },
     { GGML_METAL_FUSION_RELPOS, ops_relpos, {}, true, ggml_metal_fusion_check_relpos },
     { GGML_METAL_FUSION_SCONV, ops_sconv, {}, true,  ggml_metal_fusion_check_sconv },
     { GGML_METAL_FUSION_SCONV, ops_sconv_res, {}, true, ggml_metal_fusion_check_sconv },

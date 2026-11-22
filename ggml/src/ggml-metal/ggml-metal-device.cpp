@@ -1326,6 +1326,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_nvfp4s(ggml_metal_library_t lib) {
+    const int nsg = N_SG_NVFP4;
+    char name[256];
+    snprintf(name, 256, "kernel_mul_mv_id_nvfp4s_f32_nsg=%d", nsg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
+        ggml_metal_cv_set_bool (cv, false, FC_MUL_MV + 5);
+
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_mul_mv_id_nvfp4s_f32", name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = N_R0_NVFP4;
+    res.nr1  = 1;
+    res.nsg  = nsg;
+    res.smem = 0;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
