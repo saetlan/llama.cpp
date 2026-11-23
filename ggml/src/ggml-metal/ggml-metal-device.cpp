@@ -1341,7 +1341,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_ws(ggm
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // hill-climb: 128 weight rows per threadgroup (8 simdgroups) on the tensor path: each staged entry tile serves
+    // twice the rows (prefill +1.3%, +2% at -ub 1024); same 16-entry products, same results.
+    // GGML_METAL_MMID_R128_DISABLE=1 restores 64-row tiles
+    static const bool r128_on = getenv("GGML_METAL_MMID_R128_DISABLE") == nullptr;
+    const bool r128 = r128_on && ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor &&
+        (tsrc0 == GGML_TYPE_NVFP4 || tsrc0 == GGML_TYPE_Q8_0) && tsrc1 == GGML_TYPE_F32;
+
+    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), r128 ? "_r128" : "");
     const bool nr64 = ggml_metal_mmid_nr64(lib);
 
     snprintf(name, 256, "%s_bci=%d_ws=%d_nr64=%d", base, bc_inp, wscale ? 1 : 0, nr64 ? 1 : 0);
@@ -1359,7 +1366,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_ws(ggm
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 8192;
+    res.smem = r128 ? 16384 : 8192;
+    res.nr0  = r128 ? 128 : 64;
+    res.nsg  = r128 ? 8 : 4;
 
     return res;
 }

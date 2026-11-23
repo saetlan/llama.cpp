@@ -3421,7 +3421,10 @@ static int ggml_metal_op_mul_mat_id_ex(ggml_metal_op_t ctx, int idx, ggml_tensor
 
             const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
+            const int nr0 = pipeline.nr0 > 0 ? pipeline.nr0 : 64;
+            const int nsg = pipeline.nsg > 0 ? pipeline.nsg : 4;
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + nr0 - 1)/nr0, 1, 32*nsg, 1, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);

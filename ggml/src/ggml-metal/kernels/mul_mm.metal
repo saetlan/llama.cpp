@@ -550,7 +550,7 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
 
 // TODO: refactor into two seperate functions to avoid ifdef branching: with and without tensor support
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, short NRA = 64>
 kernel void kernel_mul_mm_id(
         constant ggml_metal_kargs_mul_mm_id & args,
         device const char * src0,
@@ -565,13 +565,16 @@ kernel void kernel_mul_mm_id(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    // hill-climb: NRA rows per threadgroup (64, or 128 with 8 simdgroups on the tensor path: each staged entry tile
+    // then serves twice the weight rows); sa holds NRA x 32 halves
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + NRA*32*sizeof(S0));
 
 #ifdef GGML_METAL_HAS_TENSOR
     threadgroup float * sc = (threadgroup float *)(shmem);
 #endif
 
-    constexpr int NR0 = 64;
+    constexpr int NR0 = NRA;
+    constexpr short NSGT = NRA/16; // simdgroups on the tensor path
     // hill-climb: with the tensor API an entry tile can hold 64 entries (four 16-entry products on one staged A tile),
     // so an expert with 33..64 entries reads its weights once instead of twice
     const     int NR1 = FC_mul_mm_id_nr64 ? 64 : 32;
@@ -617,6 +620,7 @@ kernel void kernel_mul_mm_id(
     constexpr short NR1H = 16;
 
 #ifndef GGML_METAL_HAS_TENSOR
+    static_assert(NRA == 64, "the simdgroup path has 64-row tiles");
     S0_8x8 ma[4];
     S1_8x8 mb[2];
 
@@ -632,7 +636,7 @@ kernel void kernel_mul_mm_id(
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(NR1H, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<4>> mm;
+        execution_simdgroups<NSGT>> mm;
 
 #endif
 
@@ -656,11 +660,13 @@ kernel void kernel_mul_mm_id(
     const bool has_hi = nr1 > NR1H;
 
 #ifdef GGML_METAL_HAS_TENSOR
-    // entries 32..63 of a 64-entry tile: same columns of src1, second staging half of sb
+    // entries 32..63 of a 64-entry tile: same columns of src1, second staging half of sb (with 128 threads; 256 threads
+    // stage all 64 entry rows in one pass)
+    constexpr bool two_half = (32*NSGT)/NL1 < 64;
     const bool  has_q2 = nr1 > 2*NR1H;
     const bool  has_q3 = nr1 > 3*NR1H;
     const short lr1b   = (lr1 + 32 < nr1) ? lr1 + 32 : nr1 - 1;
-    const int   idb2   = has_q2 ? ids_i32[idb + lr1b] : id;
+    const int   idb2   = two_half && has_q2 ? ids_i32[idb + lr1b] : id;
     device const T1 * y2 = (device const T1 *)(src1
         + args.nb13*i13
         + args.nb12*(idb2 / args.ne20)
@@ -676,10 +682,10 @@ kernel void kernel_mul_mm_id(
     // simdgroups 2,3 own rows NR1H..NR1-1
     const bool sg_active = has_hi || sgitg < 2;
 #else
-    auto cT0 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
-    auto cT1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
-    auto cT2 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB2), float>();
-    auto cT3 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB3), float>();
+    auto cT0 = mm.template get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
+    auto cT1 = mm.template get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
+    auto cT2 = mm.template get_destination_cooperative_tensor<decltype(tA), decltype(tB2), float>();
+    auto cT3 = mm.template get_destination_cooperative_tensor<decltype(tA), decltype(tB3), float>();
 #endif
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
@@ -800,7 +806,7 @@ kernel void kernel_mul_mm_id(
                 //const short ly = i;
 
                 *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
-                if (has_q2) {
+                if (two_half && has_q2) {
                     *(sb + NK*(32 + 8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y2 + i) : 0;
                 }
             }
@@ -814,7 +820,7 @@ kernel void kernel_mul_mm_id(
             //const short ly = i;
 
             *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y));
-            if (has_q2) {
+            if (two_half && has_q2) {
                 *(threadgroup S1_2x4 *)(sb + NK*(32 + 8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y2));
             }
         }
@@ -930,7 +936,11 @@ kernel void kernel_mul_mm_id(
 
     const short j_end = nr1 < 32*(h + 1) ? nr1 : 32*(h + 1);
 
+#ifdef GGML_METAL_HAS_TENSOR
+    for (short j = 32*h + sgitg; j < j_end; j += NSGT) {
+#else
     for (short j = 32*h + sgitg; j < j_end; j += 4) {
+#endif
         const int id = ids_i32[idb + j];
 
         const short ide = id % args.ne20;
@@ -1060,6 +1070,11 @@ template [[host_name("kernel_mul_mm_id_q5_0_f32")]]    kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_q5_1_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q5_1,    2,     dequantize_q5_1,    float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_id_nvfp4_f32")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_nvfp4,   4,     dequantize_nvfp4,   float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q8_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  float, float2x4>;
+#if defined(GGML_METAL_HAS_TENSOR)
+// hill-climb: 128 weight rows per threadgroup (8 simdgroups) for the tensor path
+template [[host_name("kernel_mul_mm_id_nvfp4_f32_r128")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_nvfp4, 4, dequantize_nvfp4, float, float4x4, float, float2x4, 128>;
+template [[host_name("kernel_mul_mm_id_q8_0_f32_r128")]]  kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,  2, dequantize_q8_0,  float, float4x4, float, float2x4, 128>;
+#endif
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_id_mxfp4_f32")]]   kernel mul_mm_id kernel_mul_mm_id<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, block_mxfp4,   2,     dequantize_mxfp4,   float,  float4x4,  float, float2x4>;
 #else
