@@ -253,6 +253,56 @@ kernel void kernel_flash_attn_ext_blk(
         dst[((i3*args.ne32 + i2)*nblk1 + i1)*nblk0 + i0] = res;
     }
 }
+// hill-climb: the blocks of a mask f16(bias + base) whose bias is finite (the rel-pos bias), scanned on the F32 base mask
+// that all heads share: a block is skipped (0) when the base block is all -INF, otherwise it is 1 (never 2 - the bias
+// makes it non-zero, and a block that did round to all zeros adds nothing either way); the result goes to all ne32 heads
+kernel void kernel_flash_attn_ext_blk_bm_f32(
+        constant ggml_metal_kargs_flash_attn_ext_blk & args,
+        device const char * mask,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int32_t Q = FC_flash_attn_ext_blk_nqptg;
+    const int32_t C = FC_flash_attn_ext_blk_ncpsg;
+
+    constexpr short NW  = N_SIMDWIDTH;
+
+    const int32_t i3 = tgpig[2];
+    const int32_t i1 = tgpig[1];
+    const int32_t i0 = tgpig[0];
+
+    char res = i0*C + C > args.ne30 || i1*Q + Q > args.ne31 ? 1 : 0;
+
+    device const float * mask_src = (device const float *) (mask + (i1*Q)*args.nb31 + i3*args.nb33) + i0*C + tiisg;
+
+    if ((C > NW || Q > 1) && res == 0) {
+        float mmax = -INFINITY;
+
+        FOR_UNROLL (short j = 0; j < Q; ++j) {
+            FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
+                mmax = max(mmax, mask_src[ii*NW]);
+            }
+
+            mask_src += args.nb31/4;
+        }
+
+        mmax = simd_max(mmax);
+
+        if (mmax > -INFINITY) {
+            res = 1;
+        }
+    }
+
+    const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
+    const int32_t nblk0 = ((args.ne30 + C - 1)/C);
+
+    if (tiisg == 0) {
+        for (int32_t h = 0; h < args.ne32; ++h) {
+            dst[((i3*args.ne32 + h)*nblk1 + i1)*nblk0 + i0] = res;
+        }
+    }
+}
+
 // compress the finite entries of each KQ mask row into a list of KV indices (ascending order),
 // padded with -1 up to n_kv_max_padded (a multiple of OP_FLASH_ATTN_EXT_VEC_NCPSG)
 // one threadgroup per mask row; the mask remains the single source of truth for the values

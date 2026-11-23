@@ -4199,17 +4199,58 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 /*.nb33 =*/ nb33,
             };
 
-            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg);
-
-            ggml_metal_encoder_set_pipeline(enc, pipeline0);
-            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
-            ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
-            ggml_metal_encoder_set_buffer  (enc, bid_blk,  2);
+            // hill-climb: when the mask is f16(rel-pos bias + F32 base mask), the blocks to skip are those of the base
+            // mask (the bias is finite): scan the base once for all heads instead of the per-head mask (same decisions)
+            const ggml_tensor * bm = nullptr;
+            {
+                static const bool bm_off = getenv("GGML_METAL_FA_BLK_BM_DISABLE") != nullptr;
+                const ggml_tensor * m = op->src[3];
+                while (!bm_off && m && (m->op == GGML_OP_RESHAPE || m->op == GGML_OP_VIEW) && m->src[0]) {
+                    m = m->src[0];
+                }
+                if (!bm_off && m && m->op == GGML_OP_CPY && m->src[0] && m->src[0]->op == GGML_OP_ADD) {
+                    const ggml_tensor * add = m->src[0];
+                    const ggml_tensor * b   = add->src[1];
+                    // add->src[0] must be the gathered rel-pos bias: CONT(PERMUTE(RESHAPE(GET_ROWS(table, distances))))
+                    const ggml_tensor * g = add->src[0];
+                    for (int d = 0; d < 4 && g && g->op != GGML_OP_GET_ROWS; ++d) {
+                        g = g->src[0];
+                    }
+                    if (g && g->op == GGML_OP_GET_ROWS && b && b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float) &&
+                            b->ne[0] == ne30 && b->ne[1] == ne31 && b->ne[2] == 1 && (b->ne[3] == ne33 || b->ne[3] == 1) &&
+                            b->nb[1] % sizeof(float) == 0) {
+                        bm = b;
+                    }
+                }
+            }
 
             const int32_t nblk1 = ((ne01 + nqptg - 1)/nqptg);
             const int32_t nblk0 = ((ne30 + ncpsg - 1)/ncpsg);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, ne32*ne33, 32, 1, 1);
+            if (bm) {
+                ggml_metal_kargs_flash_attn_ext_blk args1 = args0;
+                args1.nb31 = bm->nb[1];
+                args1.nb32 = 0;
+                args1.nb33 = bm->ne[3] == 1 ? 0 : bm->nb[3];
+
+                auto pipeline1 = ggml_metal_library_get_pipeline_flash_attn_ext_blk_bm(lib, nqptg, ncpsg);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline1);
+                ggml_metal_encoder_set_bytes   (enc, &args1, sizeof(args1), 0);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bm), 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_blk,  2);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, ne33, 32, 1, 1);
+            } else {
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline0);
+                ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_blk,  2);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, ne32*ne33, 32, 1, 1);
+            }
 
             ggml_metal_op_concurrency_reset(ctx);
         }

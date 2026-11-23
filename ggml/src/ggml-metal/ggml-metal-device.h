@@ -208,6 +208,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t nqptg,
         int32_t ncpsg);
 
+// hill-climb: the block scan on the F32 base mask shared by the heads (rel-pos masks)
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_blk_bm(ggml_metal_library_t lib, int32_t nqptg, int32_t ncpsg);
+
 // hill-climb: the tensor FA takes 16 queries per threadgroup for f16 dk = dv = 128 when the KV is at most 24k long
 // (GGML_METAL_FA_TENSOR_Q32=1 always uses the stock 32-query tile); same results either way
 bool ggml_metal_fa_tensor_q16(int dk, int dv, bool f16, int64_t ne11);
