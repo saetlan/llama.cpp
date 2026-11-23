@@ -21,41 +21,46 @@ The work was AI-assisted (Claude Code), and every change was measured on this ma
 
 ## Results
 
-One session on 23 Nov 2026, with the three setups run in the order A B C C B A, so each ran twice. Settings:
-llama-server, 131k context, 2 slots, flash attention on. Each pass takes the median of 6 decode samples.
+One session on the night of 22–23 Nov 2026. The three setups ran in the order A B C C B A, three times over, so each
+ran six times. Settings: llama-server, 131k context, 2 slots, flash attention on. Each run takes the median of 6
+decode samples.
 
-Each cell is the mean of the two passes ± half the gap between them. With two passes, that is the standard error
-of the mean:
+Speeds are the mean of the six runs ± their standard deviation, the convention llama-bench uses. With six runs,
+mean ± sd is also very close to a 95% confidence interval for the mean.
 
-| t/s | stock `418fe97` + Q8_0 | this branch, exact (default) | this branch, fast (opt-in) |
+| t/s, n = 6 | stock `418fe97` + Q8_0 | this branch, exact (default) | this branch, fast (opt-in) |
 |---|---|---|---|
-| decode, 1 user | 28.5 ± 0.1 | **47.0 ± 1.2** | 48.1 ± 0.2 |
-| decode, 2 users (total) | 39.7 ± 0.3 | **63.7 ± 3.0** | 63.4 ± 2.9 |
-| prefill, 3.3k-token prompt | 378 ± 6 | **971 ± 70** | 1018 ± 21 |
-| prefill, 12.9k-token prompt | 306 ± 2 | **965 ± 12** | 1000 ± 10 |
+| decode, 1 user | 28.6 ± 0.1 | **47.7 ± 0.9** | 48.0 ± 0.3 |
+| decode, 2 users (total) | 40.0 ± 0.3 | **65.4 ± 2.5** | 65.1 ± 2.3 |
+| prefill, 3.3k-token prompt | 382 ± 5 | **1021 ± 60** | 1062 ± 37 |
+| prefill, 12.9k-token prompt | 309 ± 3 | **998 ± 28** | 1039 ± 32 |
 
-Against stock, with the uncertainty of both sides carried into the ratio:
+Gains, with 95% confidence intervals:
 
-| | exact vs stock | fast vs stock |
-|---|---|---|
-| decode, 1 user | **+65% ± 4%** | +69% ± 1% |
-| decode, 2 users | **+60% ± 8%** | +60% ± 7% |
-| prefill, 3.3k-token prompt | **×2.57 ± 0.19** | ×2.70 ± 0.07 |
-| prefill, 12.9k-token prompt | **×3.16 ± 0.05** | ×3.27 ± 0.04 |
+| | exact vs stock | fast vs stock | fast vs exact |
+|---|---|---|---|
+| decode, 1 user | **+67%** (+64 to +70%) | +68% (+67 to +69%) | +1% (−1 to +3%) |
+| decode, 2 users | **+63%** (+57 to +70%) | +63% (+57 to +69%) | 0% (−5 to +4%) |
+| prefill, 3.3k-token prompt | **×2.67** (2.52–2.84) | ×2.78 (2.68–2.89) | +4% (−2 to +11%) |
+| prefill, 12.9k-token prompt | **×3.23** (3.14–3.32) | ×3.37 (3.26–3.48) | +4% (0 to +8%) |
 
-- Two passes give only a rough spread.
-- The branch builds varied more than stock, because their first pass ran while the machine was busier. Exact prefill
-  on the 3.3k-token prompt was 900 t/s on pass 1 and 1041 t/s on pass 2.
-- Fast against exact: only the 12.9k-token prefill gain (+3.7% ± 1.6%) is larger than the noise in this run.
+The intervals are computed on the log of the ratio of means, from each side's standard error with Welch's degrees of
+freedom.
 
-<details><summary>Raw values (pass 1 / pass 2)</summary>
+- All runs come from one evening on one Mac. The intervals cover run-to-run noise only, not differences between
+  machines or days.
+- The runs drifted up as the machine got quieter. Exact prefill on the 3.3k-token prompt went from 900 t/s on the
+  first run to about 1050, and stock rose about 3%. So the runs are not fully independent.
+- Fast against exact: decode is the same, and prefill is about 4% higher, at the edge of the noise.
+
+<details><summary>Raw values (run order)</summary>
 
 | t/s | stock + Q8_0 | exact | fast |
 |---|---|---|---|
-| decode, 1 user | 28.4 / 28.6 | 45.8 / 48.2 | 48.0 / 48.3 |
-| decode, 2 users (total) | 39.4 / 40.1 | 60.6 / 66.7 | 60.5 / 66.2 |
-| prefill, 3.3k-token prompt | 372 / 383 | 900 / 1041 | 997 / 1039 |
-| prefill, 12.9k-token prompt | 303 / 308 | 953 / 977 | 990 / 1010 |
+| decode, 1 user | 28.4 / 28.6 / 28.6 / 28.6 / 28.7 / 28.4 | 45.8 / 48.2 / 48.3 / 48.3 / 47.6 / 48.0 | 48.0 / 48.3 / 48.1 / 47.6 / 47.9 / 48.3 |
+| decode, 2 users (total) | 39.4 / 40.1 / 40.0 / 40.2 / 40.2 / 40.2 | 60.6 / 66.7 / 66.8 / 64.8 / 67.3 / 65.9 | 60.5 / 66.2 / 65.1 / 66.1 / 66.1 / 66.6 |
+| prefill, 3.3k-token prompt | 372 / 383 / 384 / 383 / 384 / 385 | 900 / 1041 / 1025 / 1046 / 1062 / 1049 | 997 / 1039 / 1093 / 1091 / 1073 / 1083 |
+| prefill, 12.9k-token prompt | 303 / 308 / 311 / 310 / 310 / 311 | 953 / 977 / 1003 / 1006 / 1021 / 1026 | 990 / 1010 / 1049 / 1059 / 1053 / 1075 |
 
 </details>
 
@@ -105,7 +110,7 @@ differences into visible greedy divergence.
 The fast column is opt-in and changes rounding: `-ub 1024 --cache-ram 4096` plus `GGML_METAL_MMID_MIN_T=6`.
 
 - KLD against the exact path is 0.0002.
-- Prefill: +3.7% ± 1.6% at 12.9k tokens in the table above, and +7% in llama-bench pp4096.
+- Prefill: +4% (95% CI 0 to +8%) at 12.9k tokens in the table above, and +7% in llama-bench pp4096.
 - Follow-up prompts of 6–31 tokens run 12–64% faster.
 - GPU peak is 46 GiB instead of 35 GiB.
 
@@ -172,8 +177,8 @@ For the fast setup, add `-ub 1024 --cache-ram 4096` and set `GGML_METAL_MMID_MIN
   The graph-level changes also affect other backends, but they were not tested there.
 - Single-user decode is close to its practical limit for exact kernels. Each token still runs about 1,750 dependent
   kernels at roughly 4–5 µs each, and the weight kernels already run near bandwidth.
-- The fast setup needs about 11 GiB more GPU memory. With other apps open it caused 140–470 MiB of swap in the run
-  above; the exact build caused none.
+- The fast setup needs about 11 GiB more GPU memory. With other apps open it caused 140–470 MiB of swap in 3 of its 6
+  runs above; the exact build caused none.
 - The relative-position bias inside flash attention (upstream PR 32740 plus a Metal port) lives in a separate local
   branch. It saves about 11 GiB of compute buffer but is slower at prefill than this branch's mask kernel.
 - The DSpark drafter is still 12–40% slower than plain decoding on this machine.
