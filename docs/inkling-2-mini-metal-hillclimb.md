@@ -21,53 +21,56 @@ The work was AI-assisted (Claude Code), and every change was measured on this ma
 
 ## Results
 
-One session on the night of 22–23 Nov 2026. The three setups ran in the order A B C C B A, three times over, so each
-ran six times. Settings: llama-server, 131k context, 2 slots, flash attention on. Each run takes the median of 6
-decode samples.
+One session on the morning of 23 Nov 2026, on a quiet machine. Setups ran in the order A B C D D C B A, three times
+over, so each ran six times. Settings: llama-server, 131k context, 2 slots, flash attention on. Each run takes the
+median of 6 decode samples. The branch columns used `213ae99`; the one later change (`dc7339e`) only affects 6–31-token
+batches (below). The previous published numbers (`703cd33`) are in the second column for comparison.
 
 Speeds are the mean of the six runs ± their standard deviation, the convention llama-bench uses. With six runs,
 mean ± sd is also very close to a 95% confidence interval for the mean.
 
-| t/s, n = 6 | stock `418fe97` + Q8_0 | this branch, exact (default) | this branch, fast (opt-in) |
-|---|---|---|---|
-| decode, 1 user | 28.6 ± 0.1 | **47.7 ± 0.9** | 48.0 ± 0.3 |
-| decode, 2 users (total) | 40.0 ± 0.3 | **65.4 ± 2.5** | 65.1 ± 2.3 |
-| prefill, 3.3k-token prompt | 382 ± 5 | **1021 ± 60** | 1062 ± 37 |
-| prefill, 12.9k-token prompt | 309 ± 3 | **998 ± 28** | 1039 ± 32 |
+| t/s, n = 6 | stock `418fe97` + Q8_0 | branch at `703cd33` | this branch, exact (default) | this branch, fast (opt-in) |
+|---|---|---|---|---|
+| decode, 1 user | 29.1 ± 0.0 | 49.4 ± 0.0 | **49.2 ± 0.1** | 49.2 ± 0.1 |
+| decode, 2 users (total) | 40.7 ± 0.1 | 67.6 ± 0.1 | **67.7 ± 0.3** | 67.7 ± 0.2 |
+| prefill, 3.3k-token prompt | 386 ± 2 | 1065 ± 1 | **1183 ± 2** | 1238 ± 16 |
+| prefill, 12.9k-token prompt | 312 ± 0 | 1027 ± 1 | **1163 ± 1** | 1232 ± 2 |
 
 Gains, with 95% confidence intervals:
 
-| | exact vs stock | fast vs stock | fast vs exact |
+| | exact vs stock | exact vs `703cd33` | fast vs exact |
 |---|---|---|---|
-| decode, 1 user | **+67%** (+64 to +70%) | +68% (+67 to +69%) | +1% (−1 to +3%) |
-| decode, 2 users | **+63%** (+57 to +70%) | +63% (+57 to +69%) | 0% (−5 to +4%) |
-| prefill, 3.3k-token prompt | **×2.67** (2.52–2.84) | ×2.78 (2.68–2.89) | +4% (−2 to +11%) |
-| prefill, 12.9k-token prompt | **×3.23** (3.14–3.32) | ×3.37 (3.26–3.48) | +4% (0 to +8%) |
+| decode, 1 user | **+69%** (+69 to +70%) | 0% (see below) | 0% (−0 to +0%) |
+| decode, 2 users | **+66%** (+66 to +67%) | 0% (−0 to +1%) | 0% (−1 to +0%) |
+| prefill, 3.3k-token prompt | **×3.07** (3.05–3.08) | +11% (+11 to +11%) | +5% (+3 to +6%) |
+| prefill, 12.9k-token prompt | **×3.73** (3.72–3.73) | +13% (+13 to +13%) | +6% (+6 to +6%) |
 
 The intervals are computed on the log of the ratio of means, from each side's standard error with Welch's degrees of
 freedom.
 
-- All runs come from one evening on one Mac. The intervals cover run-to-run noise only, not differences between
+- All runs come from one session on one Mac. The intervals cover run-to-run noise only, not differences between
   machines or days.
-- The runs drifted up as the machine got quieter. Exact prefill on the 3.3k-token prompt went from 900 t/s on the
-  first run to about 1050, and stock rose about 3%. So the runs are not fully independent.
-- Fast against exact: decode is the same, and prefill is about 4% higher, at the edge of the noise.
+- Single-user decode reads 0.4% lower than `703cd33` here, but none of the later changes touches the one-token path:
+  llama-bench decode is identical, and server-level decode moves by up to ±0.5% between builds in no particular
+  direction (code generation and memory layout).
+- The fast setup swapped 2.4 GB in one of its six runs (46 GiB of GPU memory with other apps open).
 
 <details><summary>Raw values (run order)</summary>
 
 | t/s | stock + Q8_0 | exact | fast |
 |---|---|---|---|
-| decode, 1 user | 28.4 / 28.6 / 28.6 / 28.6 / 28.7 / 28.4 | 45.8 / 48.2 / 48.3 / 48.3 / 47.6 / 48.0 | 48.0 / 48.3 / 48.1 / 47.6 / 47.9 / 48.3 |
-| decode, 2 users (total) | 39.4 / 40.1 / 40.0 / 40.2 / 40.2 / 40.2 | 60.6 / 66.7 / 66.8 / 64.8 / 67.3 / 65.9 | 60.5 / 66.2 / 65.1 / 66.1 / 66.1 / 66.6 |
-| prefill, 3.3k-token prompt | 372 / 383 / 384 / 383 / 384 / 385 | 900 / 1041 / 1025 / 1046 / 1062 / 1049 | 997 / 1039 / 1093 / 1091 / 1073 / 1083 |
-| prefill, 12.9k-token prompt | 303 / 308 / 311 / 310 / 310 / 311 | 953 / 977 / 1003 / 1006 / 1021 / 1026 | 990 / 1010 / 1049 / 1059 / 1053 / 1075 |
+| decode, 1 user | 29.1 / 29.0 / 29.1 / 29.1 / 29.1 / 29.1 | 49.1 / 49.2 / 49.3 / 49.3 / 49.3 / 49.2 | 49.1 / 49.3 / 49.2 / 49.1 / 49.3 / 49.3 |
+| decode, 2 users (total) | 40.7 / 40.9 / 40.7 / 40.7 / 40.8 / 40.7 | 67.9 / 67.2 / 67.9 / 67.7 / 68.0 / 67.7 | 67.3 / 67.8 / 67.9 / 67.8 / 67.7 / 67.7 |
+| prefill, 3.3k-token prompt | 382 / 387 / 387 / 386 / 387 / 386 | 1184 / 1178 / 1182 / 1184 / 1184 / 1184 | 1241 / 1250 / 1233 / 1258 / 1213 / 1234 |
+| prefill, 12.9k-token prompt | 311 / 312 / 312 / 312 / 313 / 312 | 1164 / 1163 / 1165 / 1163 / 1162 / 1163 | 1227 / 1232 / 1232 / 1232 / 1233 / 1234 |
 
 </details>
 
-Other measurements of the exact build:
+Other measurements of the exact build (separate runs):
 
-- llama-bench pp512 is 1183 t/s (separate run, different harness).
-- A 119k-token needle prompt (separate run) prefills at 544 t/s, against 174 t/s for the day-1 build.
+- llama-bench pp512: 1289 t/s; at 64k of context about 570 t/s.
+- A 119k-token needle prompt prefills at 624 t/s, against 544 for `703cd33` and 174 for the day-1 build.
+- Short batches at 4k of context (`dc7339e`): 16 tokens 157.5 t/s, 24 tokens 153 t/s (+8% over `213ae99`).
 
 These numbers don't include speculative decoding. With `--spec-type ngram-mod` (lossless), file edits and rewrites
 run at 78–137 t/s.
@@ -88,8 +91,15 @@ Each step was measured against the build before it, in the same session:
 | 4. Two users | Fusions also fire for 2 sequences and for small batches | 2 users +2.8% (65.4 → 67.2) |
 | 5. Short conv | Removed a 64-bit index division per thread in the prompt-batch short conv | prefill +3.3% (1006 → 1039 at 4k) |
 | 6. Narrow tiles | 32-token tiles for tensor-API matmuls with few output rows | llama-bench pp512 1162 → 1183 (+1.8%) |
+| 7. K steps | Few-row matmuls (sinks, loop control, router) take K in steps of 128 | +0.5% prefill |
+| 8. Expert tiles 64 | Expert matmul with 64-entry tiles: weights read once per 64 tokens | +1.8% prefill |
+| 9. FA tiles | Flash attention with 16 queries per threadgroup while KV ≤ 24k (more threadgroups per core) | +3.5–4% at 4k–16k |
+| 10. Rel-pos mask | Mask kernel with 2 heads per threadgroup (8 KB table, 3 threadgroups per core) | +2.8% (+4.2% at 4k) |
+| 11. Block scan | Flash-attention block scan on the shared base mask instead of every head's mask | +0.8% at 4k, +5% at 64k |
+| 12. Expert rows 128 | Expert matmul with 128 weight rows per threadgroup (8 simdgroups) | +1.3% prefill |
+| 13. Short batches | Expert matvec for 6–31 tokens: each expert's tokens in one threadgroup, weights from cache | +4–8.5% on 6–31-token batches |
 
-Steps 3–6 keep the model's outputs bit-identical. Single-user decode stayed flat after step 2: it was already near
+Steps 3–13 keep the model's outputs bit-identical. Single-user decode stayed flat after step 2: it was already near
 its limit (see Limits).
 
 ## Exactness
