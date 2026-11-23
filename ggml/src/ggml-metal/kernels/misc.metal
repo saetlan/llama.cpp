@@ -849,7 +849,8 @@ kernel void kernel_relpos_mask2_f32(
 // table entries of one bucket for all heads of the group from one load of its bias row (same per-head dot order, so
 // the same table values); the gather then handles 4 kv cells per thread with float4/int4 loads and half4 stores
 // (requires NK % 4 == 0)
-kernel void kernel_relpos_mask3_f32(
+template<short HGM>
+kernel void kernel_relpos_mask3_impl(
         constant ggml_metal_kargs_relpos2 & a2,
         device const char * bias,
         device const char * R,
@@ -863,14 +864,13 @@ kernel void kernel_relpos_mask3_f32(
         ushort3 ntg  [[threads_per_threadgroup]]) {
     constant ggml_metal_kargs_relpos & args = a2.r;
     constexpr int NR = 16;
-    constexpr int HGM = 4;
 
     const int nth = ntg.x;
     const int h0  = tgpig.y*HGM;
     const int tok = tgpig.z;
     const int t   = tok % args.Ts;
     const int s   = tok / args.Ts;
-    const int nhg = min(HGM, args.H - h0);
+    const int nhg = min((int) HGM, args.H - h0);
 
     float r[HGM][NR];
     float sk[HGM];
@@ -919,6 +919,13 @@ kernel void kernel_relpos_mask3_f32(
         }
     }
 }
+
+typedef decltype(kernel_relpos_mask3_impl<4>) kernel_relpos_mask3_t;
+
+// hill-climb: fewer heads per threadgroup -> a smaller table in threadgroup memory -> more threadgroups per core
+template [[host_name("kernel_relpos_mask3_f32")]]     kernel kernel_relpos_mask3_t kernel_relpos_mask3_impl<4>;
+template [[host_name("kernel_relpos_mask3_hg2_f32")]] kernel kernel_relpos_mask3_t kernel_relpos_mask3_impl<2>;
+template [[host_name("kernel_relpos_mask3_hg1_f32")]] kernel kernel_relpos_mask3_t kernel_relpos_mask3_impl<1>;
 
 // softmax over the nr scores of query q, then out[e] = sum_r p_r * states[e, r]; one thread per channel
 kernel void kernel_mix_tail_f32(

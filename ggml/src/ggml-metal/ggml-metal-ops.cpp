@@ -6394,7 +6394,15 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
                 (args.mne1 == 1 || mask->nb[1] % 16 == 0) && (args.mne3 == 1 || mask->nb[3] % 16 == 0) && mask->nb[0] == 4 &&
                 ggml_is_contiguous(cpy) && (uintptr_t) relp->data % 16 == 0 && (uintptr_t) mask->data % 16 == 0 &&
                 (uintptr_t) cpy->data % 8 == 0;
-            auto pipeline2 = ggml_metal_library_get_pipeline_by_name(lib, use3 ? "kernel_relpos_mask3_f32" : "kernel_relpos_mask2_f32");
+            // hill-climb: for prompt batches the register-table variant takes 2 heads per threadgroup: an 8 KB table instead
+            // of 16.6 KB, so 3 threadgroups share a core instead of 1 (prefill +3-4%); the same table values and mask (exact).
+            // One-token long-KV masks keep 4. GGML_METAL_RELPOS_HG=4 (or 1) selects another head count for prompt batches
+            static const int hg3 = [] { const char * e = getenv("GGML_METAL_RELPOS_HG"); const int v = e ? atoi(e) : 2; return (v == 1 || v == 4) ? v : 2; }();
+            const int hgp = (int64_t) args.Ts*args.S > 1 ? hg3 : 4;
+            const int HGd = use3 ? hgp : HG;
+            const size_t smemd = GGML_PAD((size_t) HGd*Ep*sizeof(float), 16);
+            auto pipeline2 = ggml_metal_library_get_pipeline_by_name(lib, !use3 ? "kernel_relpos_mask2_f32" :
+                hgp == 2 ? "kernel_relpos_mask3_hg2_f32" : hgp == 1 ? "kernel_relpos_mask3_hg1_f32" : "kernel_relpos_mask3_f32");
 
             ggml_metal_encoder_set_pipeline(enc, pipeline2);
             ggml_metal_encoder_set_bytes   (enc, &a2, sizeof(a2), 0);
@@ -6404,12 +6412,12 @@ int ggml_metal_op_relpos_fused(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(relp),  4);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask),  5);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cpy),   6);
-            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smemd, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((args.NK + CH - 1)/CH), (args.H + HG - 1)/HG, args.Ts*args.S, 256, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((args.NK + CH - 1)/CH), (args.H + HGd - 1)/HGd, args.Ts*args.S, 256, 1, 1);
             static const bool relpos_twice = getenv("GGML_METAL_RELPOS_TWICE") != nullptr;
             if (relpos_twice) { // profiling only: the same output written twice, to time the kernel end to end
-                ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((args.NK + CH - 1)/CH), (args.H + HG - 1)/HG, args.Ts*args.S, 256, 1, 1);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((args.NK + CH - 1)/CH), (args.H + HGd - 1)/HGd, args.Ts*args.S, 256, 1, 1);
             }
 
             return 7;
