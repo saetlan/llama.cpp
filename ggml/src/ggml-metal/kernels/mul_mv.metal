@@ -3897,6 +3897,74 @@ kernel void kernel_mul_mv_id_nvfp4s_f32(
         args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg, scale[i02]);
 }
 
+// hill-climb: kernel_mul_mv_id_nvfp4s_f32 with the tokens of one expert grouped (tiles from kernel_mul_mm_id_map0): the
+// threadgroup runs the unchanged single-token routine once per token of the tile, so the arithmetic is that of
+// kernel_mul_mv_id_nvfp4s_f32 and only the weight reads change (the rows of this threadgroup stay in cache for the
+// next tokens). grid: (row blocks, tiles)
+kernel void kernel_mul_mv_id_nvfp4s_grp_f32(
+        constant ggml_metal_kargs_mul_mv_id & args,
+        device const char  * src0s,
+        device const char  * src1,
+        device       char  * dst,
+        device const char  * htpe,
+        device const char  * hids,
+        device const float * scale,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    device const uint32_t * tpe = (device const uint32_t *) htpe;
+    device const int32_t  * ids = (device const int32_t  *) hids;
+
+    const int tile = tgpig.y;
+    if (tile >= (int) tpe[0]) {
+        return;
+    }
+
+    const int im  = tpe[1 + 3*tile];     // expert
+    const int idb = tpe[1 + 3*tile + 1]; // first entry
+    const int nt  = tpe[1 + 3*tile + 2]; // entries
+
+    ggml_metal_kargs_mul_mv args0 = {
+        /*.ne00 =*/ args.ne00,
+        /*.ne01 =*/ args.ne01,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ args.nb00,
+        /*.nb01 =*/ args.nb01,
+        /*.nb02 =*/ args.nb02,
+        /*.nb03 =*/ args.nb02,
+        /*.ne10 =*/ args.ne10,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ args.nb10,
+        /*.nb11 =*/ args.nb11,
+        /*.nb12 =*/ args.nb12,
+        /*.nb13 =*/ args.nb12,
+        /*.ne0  =*/ args.ne0,
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ args.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    device const char * src0_cur = src0s + im*args.nb02;
+    const float post = scale[im];
+
+    const uint3 tg = uint3(tgpig.x, 0, 0);
+
+    for (int e = 0; e < nt; ++e) {
+        const int id   = ids[idb + e];
+        const int slot = id % args.nei0;
+        const int tok  = id / args.nei0;
+
+        device const char * src1_cur = src1 + (slot % args.ne11)*args.nb11 + tok*args.nb12;
+        device       char * dst_cur  = dst  + ((uint64_t) slot*args.ne0 + (uint64_t) tok*args.ne1*args.ne0)*sizeof(float);
+
+        kernel_mul_mv_nvfp4_f32_impl_post<N_R0_NVFP4, thread const ggml_metal_kargs_mul_mv &>(
+            args0, src0_cur, src1_cur, dst_cur, shmem, tg, tiisg, sgitg, post);
+    }
+}
+
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;
