@@ -2253,7 +2253,71 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    load_post_tensors();
+
     return true;
+}
+
+void llama_model_base::keep_weights(ggml_context_ptr && ctx, ggml_backend_buffer_ptr && buf) {
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+}
+
+ggml_tensor * llama_model_base::pack_weight_rows(const std::vector<const ggml_tensor *> & parts, const char * name, int64_t zero_rows) {
+    GGML_ASSERT(!parts.empty());
+    const ggml_tensor * p0 = parts[0];
+    int64_t rows = 0;
+    for (const ggml_tensor * p : parts) {
+        if (!p || p->type != p0->type || p->ne[0] != p0->ne[0] || p->ne[2] != 1 || p->ne[3] != 1 || !ggml_is_contiguous(p) ||
+            p->buffer == nullptr || p->data == nullptr) { // no data: weights not loaded (no_alloc)
+            return nullptr;
+        }
+        rows += p->ne[1];
+    }
+    rows += zero_rows;
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(p0->buffer);
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            for (const ggml_tensor * p : parts) {
+                if (!ggml_backend_buft_is_host(ggml_backend_buffer_get_type(p->buffer))) {
+                    return nullptr; // CPU extra buffer (repacked layout): rows can't be copied as stored
+                }
+            }
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return nullptr;
+    }
+    ggml_tensor * packed = ggml_new_tensor_2d(ctx.get(), p0->type, p0->ne[0], rows);
+    ggml_set_name(packed, name);
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buffer) {
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<uint8_t> tmp;
+    size_t offs = 0;
+    for (const ggml_tensor * p : parts) {
+        const size_t n = ggml_nbytes(p);
+        tmp.resize(n);
+        ggml_backend_tensor_get(p, tmp.data(), 0, n);
+        ggml_backend_tensor_set(packed, tmp.data(), offs, n);
+        offs += n;
+    }
+    if (zero_rows > 0) {
+        tmp.assign(ggml_nbytes(packed) - offs, 0);
+        ggml_backend_tensor_set(packed, tmp.data(), offs, tmp.size());
+    }
+    keep_weights(std::move(ctx), std::move(buffer));
+    return packed;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

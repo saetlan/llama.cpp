@@ -1086,6 +1086,9 @@ struct llm_graph_amax_src1 {
 };
 
 struct llm_graph_context {
+    // hill-climb: F32 copies of the input masks, made once per graph (the rel-pos attention adds a bias to them)
+    mutable std::map<ggml_tensor *, ggml_tensor *> mask_f32_cache;
+
     const llama_model & model;
 
     const llama_hparams & hparams;

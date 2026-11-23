@@ -1529,7 +1529,7 @@ static bool ggml_metal_supports_mul_mat_op(
         bool mm_path) {
     if (!has_simdgroup_reduction ||
         op->src[0]->type == GGML_TYPE_F8_E4M3 ||
-        op->src[0]->type == GGML_TYPE_NVFP4 ||
+        (op->src[0]->type == GGML_TYPE_NVFP4 && op->op != GGML_OP_MUL_MAT_ID) || // NVFP4: only MUL_MAT_ID kernels
         op->src[0]->type == GGML_TYPE_TQ1_0) {
         return false;
     }

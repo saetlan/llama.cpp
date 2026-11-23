@@ -971,10 +971,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
-    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
-    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    constexpr int NRA  = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
+    constexpr int NRB4 = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    constexpr int NRB1 = SZ_SIMDGROUP * 1            * N_MM_SIMD_GROUP_X;
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+
+    // hill-climb: narrow token tiles when the default tiling leaves the GPU mostly idle (few output rows)
+    static const bool narrow_off = getenv("GGML_METAL_MM_NARROW_DISABLE") != nullptr;
+    const int64_t n_tg4 = ((op->ne[0] + NRA - 1)/NRA) * ((op->ne[1] + NRB4 - 1)/NRB4) * op->ne[2] * op->ne[3];
+    const bool narrow = has_tensor && !narrow_off && n_tg4 < 64 &&
+        (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_Q8_0) && tsrc1 == GGML_TYPE_F32;
+    const int NRB = narrow ? NRB1 : NRB4;
+
+    // hill-climb: few-row products are bound by their serial K loop (two barriers per K step), so the narrow tiles take
+    // K in steps of 8*SZ_SIMDGROUP; GGML_METAL_MM_NARROW_NK=2 restores the default step (same results either way)
+    static const int narrow_nk = [] {
+        const char * s = getenv("GGML_METAL_MM_NARROW_NK");
+        return (s && atoi(s) == N_MM_NK) ? N_MM_NK : 8;
+    }();
+    const int nk = narrow ? narrow_nk : N_MM_NK;
+    char nk_suffix[8] = "";
+    if (nk != N_MM_NK) {
+        snprintf(nk_suffix, sizeof(nk_suffix), "k%d", nk);
+    }
 
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
@@ -986,7 +1006,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), narrow ? "_bx1" : "", nk_suffix);
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -1010,7 +1030,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = NRA;
         res.nr1 = NRB;
 
-        const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
+        const size_t smem_a = NRA * (SZ_SIMDGROUP * nk) * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else {
         res.nr0 = 64;
@@ -1265,17 +1285,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
+// hill-climb: 64-entry tiles in kernel_mul_mm_id (tensor path): an expert with 33..64 entries reads its weights once,
+// same results; the tile map and the kernel must agree. GGML_METAL_MMID_NR64_DISABLE=1 restores 32-entry tiles
+static bool ggml_metal_mmid_nr64(ggml_metal_library_t lib) {
+    static const bool on = getenv("GGML_METAL_MMID_NR64_DISABLE") == nullptr;
+    return on && ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];
     char name[256];
 
+    const bool nr64 = ggml_metal_mmid_nr64(lib);
+
     snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
-    snprintf(name, 256, "%s_ne02=%d", base, ne02);
+    snprintf(name, 256, "%s_ne02=%d_nr64=%d", base, ne02, nr64 ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
         ggml_metal_cv_set_int32(cv, ne02, FC_MUL_MM + 7);
+        ggml_metal_cv_set_bool(cv, nr64, FC_MUL_MM + 10);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1299,6 +1329,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_zero(g
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op) {
+    return ggml_metal_library_get_pipeline_mul_mm_id_ws(lib, op, false);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_ws(ggml_metal_library_t lib, const ggml_tensor * op, bool wscale) {
     char base[256];
     char name[256];
 
@@ -1307,21 +1341,90 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d", base, bc_inp);
+    // hill-climb: 128 weight rows per threadgroup (8 simdgroups) on the tensor path: each staged entry tile serves
+    // twice the rows (prefill +1.3%, +2% at -ub 1024); same 16-entry products, same results.
+    // GGML_METAL_MMID_R128_DISABLE=1 restores 64-row tiles
+    static const bool r128_on = getenv("GGML_METAL_MMID_R128_DISABLE") == nullptr;
+    const bool r128 = r128_on && ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor &&
+        (tsrc0 == GGML_TYPE_NVFP4 || tsrc0 == GGML_TYPE_Q8_0) && tsrc1 == GGML_TYPE_F32;
+
+    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), r128 ? "_r128" : "");
+    const bool nr64 = ggml_metal_mmid_nr64(lib);
+
+    snprintf(name, 256, "%s_bci=%d_ws=%d_nr64=%d", base, bc_inp, wscale ? 1 : 0, nr64 ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+        ggml_metal_cv_set_bool(cv, wscale, FC_MUL_MM + 9);
+        ggml_metal_cv_set_bool(cv, nr64,   FC_MUL_MM + 10);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 8192;
+    res.smem = r128 ? 16384 : 8192;
+    res.nr0  = r128 ? 128 : 64;
+    res.nsg  = r128 ? 8 : 4;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_nvfp4s_grp(ggml_metal_library_t lib) {
+    const int nsg = N_SG_NVFP4;
+    char name[256];
+    snprintf(name, 256, "kernel_mul_mv_id_nvfp4s_grp_f32_nsg=%d", nsg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
+        ggml_metal_cv_set_bool (cv, false, FC_MUL_MV + 5);
+
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_mul_mv_id_nvfp4s_grp_f32", name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = N_R0_NVFP4;
+    res.nr1  = 1;
+    res.nsg  = nsg;
+    res.smem = 0;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_nvfp4s(ggml_metal_library_t lib) {
+    const int nsg = N_SG_NVFP4;
+    char name[256];
+    snprintf(name, 256, "kernel_mul_mv_id_nvfp4s_f32_nsg=%d", nsg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
+        ggml_metal_cv_set_bool (cv, false, FC_MUL_MV + 5);
+
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_mul_mv_id_nvfp4s_f32", name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = N_R0_NVFP4;
+    res.nr1  = 1;
+    res.nsg  = nsg;
+    res.smem = 0;
 
     return res;
 }
@@ -1398,6 +1501,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
+            } break;
+        case GGML_TYPE_NVFP4:
+            {
+                nsg = N_SG_NVFP4;
+                nr0 = N_R0_NVFP4;
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -1843,6 +1951,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_k
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_blk_bm(ggml_metal_library_t lib, int32_t nqptg, int32_t ncpsg) {
+    char name[256];
+    snprintf(name, 256, "kernel_flash_attn_ext_blk_bm_f32_nqptg=%d_ncpsg=%d", nqptg, ncpsg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int32(cv, nqptg, FC_FLASH_ATTN_EXT_BLK + 24);
+        ggml_metal_cv_set_int32(cv, ncpsg, FC_FLASH_ATTN_EXT_BLK + 25);
+
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_flash_attn_ext_blk_bm_f32", name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_blk(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
@@ -1886,13 +2013,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
     return res;
 }
 
+bool ggml_metal_fa_tensor_q16(int dk, int dv, bool f16, int64_t ne11) {
+    // 16 queries per threadgroup: ~10 KB of threadgroup memory instead of ~20 KB, so 2-3 threadgroups share a core
+    // (prefill +3-5% at 4k-16k context on an M5 Pro); past ~24k of KV every threadgroup re-reads the whole K/V from
+    // memory and the 32-query tile is faster again (-3% at 32k, -9% at 64k with 16). Each row's online softmax is
+    // the same in both tiles, so the choice does not change the results
+    static const bool q32 = getenv("GGML_METAL_FA_TENSOR_Q32") != nullptr;
+    return !q32 && dk == 128 && dv == 128 && f16 && ne11 <= 24576;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_tensor(
         ggml_metal_library_t lib,
         const ggml_tensor * op,
         bool has_mask,
         bool has_sinks,
         bool has_bias,
-        bool has_scap) {
+        bool has_scap,
+        bool q16) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1903,7 +2040,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
 
     const char * type = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
 
-    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d", type, dk, dv);
+    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d%s", type, dk, dv, q16 ? "_q16s8" : "");
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d", base, has_mask, has_sinks, has_bias, has_scap);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -2475,6 +2612,59 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d(ggml_m
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name(ggml_metal_library_t lib, const char * name) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_relpos(ggml_metal_library_t lib) {
+    const char * name = "kernel_relpos_mask_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sconv(ggml_metal_library_t lib) {
+    const char * name = "kernel_sconv_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ctrl_mix(ggml_metal_library_t lib) {
+    const char * name = "kernel_ctrl_mix_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_clip_rows(ggml_metal_library_t lib) {
+    const char * name = "kernel_clip_rows_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_situ(ggml_metal_library_t lib) {
+    const char * name = "kernel_situ_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
     return res;
 }
 

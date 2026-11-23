@@ -25,6 +25,14 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+// hill-climb profiling (GGML_METAL_OPPROF): move the op context to a new command buffer, the i-th encodable node, and a
+// per-graph table of GPU time per op group
+void                 ggml_metal_op_swap_cmd_buf(ggml_metal_op_t ctx, ggml_metal_cmd_buf_t cmd_buf);
+struct ggml_tensor * ggml_metal_op_node_at     (ggml_metal_op_t ctx, int i);
+void                 ggml_metal_opprof_add     (const struct ggml_tensor * t, int n_nodes, double seconds);
+void                 ggml_metal_opprof_dump    (int n_nodes_graph);
+bool                 ggml_metal_op_twice_match (const struct ggml_tensor * t, int n_nodes);
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //
@@ -94,6 +102,20 @@ int ggml_metal_op_conv_transpose_1d (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_transpose_2d (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_col2im_1d         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_snake_fused       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_situ_fused        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_ctrl_mix_fused    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_sconv_fused       (ggml_metal_op_t ctx, int idx, int n);
+int ggml_metal_op_sconv_dyn_fused   (ggml_metal_op_t ctx, int idx, int n);
+int ggml_metal_op_row_store_fused   (ggml_metal_op_t ctx, int idx, int n, int mode);
+int ggml_metal_op_relpos_fused      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mix_tail_fused    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_gate_mul_fused    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mv_id_scale_fused (ggml_metal_op_t ctx, int idx, int n);
+int ggml_metal_op_norm_concat_fused (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_cat_mv_fused      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_gf_ctrl_fused     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_gate_mv_fused     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_clip_rows_fused   (ggml_metal_op_t ctx, int idx, int n);
 int ggml_metal_op_upscale           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad_reflect_1d    (ggml_metal_op_t ctx, int idx);

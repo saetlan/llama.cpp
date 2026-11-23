@@ -20,7 +20,10 @@ struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 16
+#define GGML_METAL_FUSION_MAX 48
+
+// the optimizer chains back-to-back patterns into one packed group only up to this many nodes (raw span)
+#define GGML_METAL_FUSION_CHAIN_MAX 16
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
@@ -43,6 +46,21 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_SITU,         // SCALE + TANH + SCALE + SIGMOID + MUL + SCALE + TANH + SCALE + MUL (situ GLU)
+    GGML_METAL_FUSION_CLIP_ROWS,    // [MUL] + SQR + SUM_ROWS + SQRT + SCALE + FILL + DIV + CLAMP + MUL (row L2 clip)
+    GGML_METAL_FUSION_CTRL_MIX,     // TANH + MUL + SUB + TANH + MUL + ADD: (c - tanh(f)*c) + tanh(g)*m
+    GGML_METAL_FUSION_SCONV,        // CONCAT + CPY + SSM_CONV + ADD + SCALE (short conv, state store, residual)
+    GGML_METAL_FUSION_RELPOS,       // MUL_MAT + SUB + CONT + GET_ROWS + CONT + ADD + CPY (inkling2 rel-pos F16 mask)
+    GGML_METAL_FUSION_MIX_TAIL,     // CONT + MUL_MAT + SOFT_MAX + MUL_MAT: scores product, then softmax-weighted sum
+    GGML_METAL_FUSION_GATE_MUL,     // UNARY(sigmoid) + MUL
+    GGML_METAL_FUSION_GATE_MV,      // UNARY(sigmoid) + MUL + Q8_0 MUL_MAT at one token: matvec over c*sigmoid(g)
+    GGML_METAL_FUSION_GF_CTRL,      // packed gain|forget F32 MUL_MAT + VIEW x2 + control blend (TANH MUL SUB TANH MUL ADD), one token
+    GGML_METAL_FUSION_CAT_MV,       // CONCAT(a, b, dim 0) + F32 MUL_MAT at one token (inkling2 control input)
+    GGML_METAL_FUSION_NORM_CONCAT,  // RMS_NORM (no weight) + [RESHAPE] + CONCAT(stack, normed, dim 1): both outputs written
+    GGML_METAL_FUSION_MV_ID_SCALE,  // MUL_MAT_ID (NVFP4, matvec path) + [REPEAT] + GET_ROWS + MUL by the per-expert scale
+    GGML_METAL_FUSION_SCONV_DYN,    // short conv with 4 input-dependent taps per head (17 ops)
+    GGML_METAL_FUSION_CLIP_STORE,   // row L2 clip (no scale) + VIEW + SET_ROWS (K into the f16 cache)
+    GGML_METAL_FUSION_NORM_STORE,   // RMS_NORM (no weight) + VIEW + SET_ROWS (V into the f16 cache)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

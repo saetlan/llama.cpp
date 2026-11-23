@@ -69,6 +69,34 @@ void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
     }
 }
 
+void llama_model_inkling2_loop::load_post_tensors() {
+    // the per-expert weight scales (NVFP4 experts) are looked up by layer name after load_arch_tensors copied the
+    // physical layers into the loop slots, so the slots past n_phys found none: share the physical layer's
+    for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
+        auto       & d = layers[il];
+        const auto & s = layers[layer_phys(il)];
+        if (!d.ffn_up_exps_s)      { d.ffn_up_exps_s      = s.ffn_up_exps_s;      }
+        if (!d.ffn_gate_exps_s)    { d.ffn_gate_exps_s    = s.ffn_gate_exps_s;    }
+        if (!d.ffn_down_exps_s)    { d.ffn_down_exps_s    = s.ffn_down_exps_s;    }
+        if (!d.ffn_up_exps_in_s)   { d.ffn_up_exps_in_s   = s.ffn_up_exps_in_s;   }
+        if (!d.ffn_gate_exps_in_s) { d.ffn_gate_exps_in_s = s.ffn_gate_exps_in_s; }
+        if (!d.ffn_down_exps_in_s) { d.ffn_down_exps_in_s = s.ffn_down_exps_in_s; }
+    }
+
+    llama_model_inkling2::load_post_tensors();
+    if (getenv("LLAMA_INKLING_NO_PACK")) {
+        return;
+    }
+    for (size_t i = 0; i < loop_layers.size(); ++i) {
+        auto & l = loop_layers[i];
+        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
+            char name[GGML_MAX_NAME];
+            snprintf(name, sizeof(name), "loop.%zu.ctrl_gf.%d.packed", i + core_start, c);
+            l.ctrl_gf[c] = pack_weight_rows({ l.ctrl_gain[c], l.ctrl_forget[c] }, name);
+        }
+    }
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }

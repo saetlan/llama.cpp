@@ -1,5 +1,13 @@
 # llama.cpp
 
+> **Fork branch `inkling-hc`:** a Metal speed hill climb for Inkling 2 Mini on Apple Silicon (M5 Pro). Compared
+> with stock (mean of 6 runs), decode is +69% (29.1 → 49.2 t/s) and prefill is ×3.1–3.7 (386 → 1183 t/s on a
+> 3.3k-token prompt).
+> The method follows 0xSero's
+> [inference-optimisation skill](https://github.com/sybil-solutions/inference-optimisation-skill). See
+> [docs/inkling-2-mini-metal-hillclimb.md](docs/inkling-2-mini-metal-hillclimb.md). This branch is not upstream
+> llama.cpp.
+
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">

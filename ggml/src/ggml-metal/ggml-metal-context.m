@@ -53,6 +53,8 @@ struct ggml_metal {
 
     // command buffer state
     int n_cb;           // number of extra threads used to submit the command buffers
+    int timing; int64_t t_n, t_main, t_rest, t_wait; // hill-climb: GGML_METAL_TIMING, per-graph encode/wait times
+    int opprof; // hill-climb: GGML_METAL_OPPROF, each op group in its own command buffer, GPU time per group
 
     // first node of each extra command buffer, then the end of the graph
     int cb_start[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
@@ -146,6 +148,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             res->debug_graph = val ? atoi(val) : 0;
         }
 
+        res->timing = getenv("GGML_METAL_TIMING") != NULL; res->t_n = res->t_main = res->t_rest = res->t_wait = 0;
+        res->opprof = getenv("GGML_METAL_OPPROF") != NULL;
         res->use_graph_optimize = true;
 
         if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
@@ -254,8 +258,10 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        const int64_t tw0 = ctx->timing ? ggml_time_us() : 0;
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
+        if (ctx->timing) { ctx->t_wait += ggml_time_us() - tw0; }
     }
 
     // check status of all command buffers
@@ -563,6 +569,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
+        const int64_t tm0 = ctx->timing ? ggml_time_us() : 0;
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
@@ -579,6 +586,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             ctx->encode_async(n_cb);
         }
 
+        const int64_t tm1 = ctx->timing ? ggml_time_us() : 0;
         // remember the command buffer for the next iteration
         ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
 
@@ -605,6 +613,18 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        if (ctx->opprof) {
+            ggml_metal_opprof_dump(gf->n_nodes);
+        }
+        if (ctx->timing) {
+            ctx->t_main += tm1 - tm0; ctx->t_rest += ggml_time_us() - tm1;
+            if (++ctx->t_n % 256 == 0) {
+                fprintf(stderr, "metal timing (256 graphs, %d nodes): encode main %.3f ms, encode rest %.3f ms, wait %.3f ms\n",
+                    gf->n_nodes, ctx->t_main/256e3, ctx->t_rest/256e3, ctx->t_wait/256e3);
+                ctx->t_main = ctx->t_rest = ctx->t_wait = 0;
+            }
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -733,6 +753,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     if (ggml_metal_fusion_info_stats(ctx->finfo)) {
         n_cb = 0;
     }
+    if (ctx->opprof) {
+        n_cb = 0;
+    }
 
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
@@ -772,9 +795,24 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->debug_graph);
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+            struct ggml_tensor * nd = ctx->opprof ? ggml_metal_op_node_at(ctx_op, idx) : NULL;
+            struct ggml_tensor * n0 = ggml_metal_op_node_at(ctx_op, idx);
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
                 break;
+            }
+            if (ggml_metal_op_twice_match(n0, res)) {
+                ggml_metal_op_encode(ctx_op, idx);
+            }
+
+            if (ctx->opprof) {
+                id<MTLCommandQueue> queue = (id<MTLCommandQueue>) ggml_metal_device_get_queue(ctx->dev);
+                id<MTLCommandBuffer> next = [queue commandBuffer];
+                ggml_metal_op_swap_cmd_buf(ctx_op, (ggml_metal_cmd_buf_t) next);
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+                ggml_metal_opprof_add(nd, res, [cmd_buf GPUEndTime] - [cmd_buf GPUStartTime]);
+                cmd_buf = next;
             }
 
             idx += res - 1;

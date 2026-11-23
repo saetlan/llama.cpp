@@ -7,6 +7,8 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include "ggml-cpp.h"
+
 #include <map>
 #include <memory>
 #include <string>
@@ -1138,6 +1140,13 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // hill-climb: after the weights are loaded, an architecture may derive extra weights (e.g. packed projections)
+    virtual void load_post_tensors() {}
+    // keep a context and its buffer alive with the model's weights
+    void keep_weights(ggml_context_ptr && ctx, ggml_backend_buffer_ptr && buf);
+    // a new weight tensor holding the rows of parts (same type and row size) back to back, in the buffer type of parts[0]
+    ggml_tensor * pack_weight_rows(const std::vector<const ggml_tensor *> & parts, const char * name, int64_t zero_rows = 0);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

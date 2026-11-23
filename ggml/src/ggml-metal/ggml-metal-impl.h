@@ -50,6 +50,9 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
+#define N_R0_NVFP4 2
+#define N_SG_NVFP4 2
+
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2
 
@@ -711,6 +714,185 @@ typedef struct {
     int32_t T;
     int32_t C;
 } ggml_metal_kargs_snake;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nbu1;
+    uint64_t nbu2;
+    float    sc[4]; // the four SCALE nodes: scale
+    float    bi[4]; //                       bias
+} ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t  nl;     // float4 per row
+    int32_t  has_scale;
+    uint64_t nb1;    // cur strides
+    uint64_t nb2;
+    uint64_t nbs1;   // scale row stride
+    uint64_t nbd1;   // out strides
+    uint64_t nbd2;
+    float    sc;     // SCALE node: scale, bias
+    float    bi;
+    float    thr;    // FILL value
+    float    lo;     // CLAMP bounds
+    float    hi;
+} ggml_metal_kargs_clip_rows;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nbc1; // row strides of c, m, f, g
+    uint64_t nbm1;
+    uint64_t nbf1;
+    uint64_t nbg1;
+} ggml_metal_kargs_ctrl_mix;
+
+typedef struct {
+    int32_t  C;
+    int32_t  T;
+    int32_t  S;
+    uint64_t nbp1;  // past (3, C, S) strides
+    uint64_t nbp2;
+    uint64_t nbw1;  // weight row (4 floats per channel)
+    uint64_t nbx1;  // cur row stride (one token)
+    uint64_t nbs1;  // state cell row stride (one sequence)
+    uint64_t nbd1;  // out row stride (one token)
+    uint64_t nbr1;  // residual row stride (one token)
+    int32_t  has_res;
+    float    sc;    // SCALE
+    float    bi;
+} ggml_metal_kargs_sconv;
+
+typedef struct {
+    int32_t  C;
+    int32_t  cph;   // channels per head
+    uint64_t nbp1;  // past channel stride
+    uint64_t nbw1;  // weight row
+    uint64_t nbd1;  // projection: head stride (lag stride is 4 bytes)
+    uint64_t nbd2;  // projection: token stride
+    uint64_t nbp2;  // past: sequence stride
+    uint64_t nbs1;  // state: sequence stride
+    int32_t  T;     // tokens per sequence
+    float    sc;
+    float    bi;
+} ggml_metal_kargs_sconv_dyn;
+
+typedef struct {
+    int32_t  nl;      // float4 per head row
+    int32_t  mode;    // 0: L2 clip, 1: rms_norm
+    uint64_t nb1;     // value strides: head, token
+    uint64_t nb2;
+    uint64_t nbd1;    // cache row stride
+    uint64_t nbi0;    // index stride
+    int32_t  idx_i64;
+    float    sc;      // clip: SCALE scale, bias, FILL value, CLAMP bounds; rms_norm: eps in sc, row size in bi
+    float    bi;
+    float    thr;
+    float    lo;
+    float    hi;
+} ggml_metal_kargs_row_store;
+
+typedef struct {
+    int32_t  E4;    // float4 per row
+    int32_t  K;     // stack rows
+    float    eps;
+    int32_t  E;     // row length (the mean divides by it, as rms_norm does)
+    uint64_t nbx1;  // x row (token) stride
+    uint64_t nbs1;  // stack row stride
+    uint64_t nbs2;  // stack token stride
+    uint64_t nbn1;  // normed token stride
+    uint64_t nbc1;  // concat row stride
+    uint64_t nbc2;  // concat token stride
+} ggml_metal_kargs_norm_concat;
+
+typedef struct {
+    int32_t  E;     // channels (row length of the states), multiple of 32
+    int32_t  nr;    // states rows (<= 8)
+    uint64_t nbs1;  // states row stride
+    float    scale; // softmax scale
+} ggml_metal_kargs_mix_tail1;
+
+typedef struct {
+    int32_t  E;
+    int32_t  nr;    // states rows (<= 8)
+    uint64_t nbs1;  // states row stride
+    uint64_t nbs2;  // per token (grid z): states, query, output
+    uint64_t nbq2;
+    uint64_t nbd2;
+    float    scale; // softmax scale
+} ggml_metal_kargs_mix_tail1t;
+
+typedef struct {
+    int32_t  ne00;  // vector length (Na + Nb)
+    int32_t  ne01;  // output rows
+    int32_t  Na;    // elements taken from a
+    uint64_t nb01;  // weight row stride
+    int32_t  T;     // tokens (token batches: the mv_ext replica)
+    uint64_t nba1;  // per token: a, b
+    uint64_t nbb1;
+    int16_t  nsg;   // mv_ext parameters of the separate product
+    int16_t  nxpsg;
+} ggml_metal_kargs_cat_mv;
+
+typedef struct {
+    int32_t  ne00;  // low-rank length (32..128)
+    int32_t  E;     // channels
+    uint64_t nb01;  // weight row stride
+    uint64_t nbx1;  // per token (grid y): low-rank input, c, m, output
+    uint64_t nbc1;
+    uint64_t nbm1;
+    uint64_t nbd1;
+} ggml_metal_kargs_gf_ctrl;
+
+typedef struct {
+    int32_t  ne00;  // input length (multiple of 32)
+    int32_t  ne01;  // output rows
+    uint64_t nb01;  // weight row stride
+} ggml_metal_kargs_gate_mv;
+
+typedef struct {
+    int32_t  NR;    // relative features
+    int32_t  H;
+    int32_t  NK;    // kv cells
+    int32_t  Ts;    // tokens per stream
+    int32_t  S;     // streams
+    int32_t  mne1;  // mask broadcast extents (1 or full)
+    int32_t  mne3;
+    uint64_t nbb1;  // bias row stride
+    uint64_t nbR1;  // R strides (head, token)
+    uint64_t nbR2;
+    uint64_t nbs1;  // sinks token stride
+    uint64_t nbp1;  // rel_pos token stride
+    uint64_t nbm1;  // mask strides
+    uint64_t nbm3;
+} ggml_metal_kargs_relpos;
+
+typedef struct {
+    ggml_metal_kargs_relpos r;
+    int32_t  Ep;    // bias table rows (relative distance buckets)
+    int32_t  HG;    // heads per threadgroup
+    int32_t  CH;    // kv cells per threadgroup
+} ggml_metal_kargs_relpos2;
+
+typedef struct {
+    int32_t  E;
+    int32_t  nr;
+    uint64_t nbs1;  // states row stride
+    uint64_t nbp1;  // scores: per query
+    uint64_t nbd1;  // out: per query
+    uint64_t nbs2;  // per token (grid z)
+    uint64_t nbp2;
+    uint64_t nbd2;
+    float    scale;
+} ggml_metal_kargs_mix_tail;
+
+typedef struct {
+    int32_t n4;     // float4 elements
+} ggml_metal_kargs_gate_mul;
 
 typedef struct {
     int32_t  IC;

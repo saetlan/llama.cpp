@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="470" viewBox="0 0 880 470" font-family="system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Speed after each optimisation step relative to stock llama.cpp">
+<title>Inkling 2 Mini hill climb: speed after each step, relative to stock llama.cpp</title>
+<text x="58" y="26" font-size="16" font-weight="600" fill="#f0efec">Speed after each step, relative to stock llama.cpp</text>
+<text x="58" y="46" font-size="12" fill="#c3c2b7">llama-server on an M5 Pro, mean of 2 runs per build. Stock: prefill 384 / 310 t/s, decode 29.1 t/s.</text>
+<line x1="58" y1="70" x2="76" y2="70" stroke="#3987e5" stroke-width="2.5" stroke-linecap="round"/>
+<text x="82" y="74" font-size="12" fill="#c3c2b7">Prefill, 12.9k-token prompt</text>
+<line x1="295.7" y1="70" x2="313.7" y2="70" stroke="#d95926" stroke-width="2.5" stroke-linecap="round"/>
+<text x="319.7" y="74" font-size="12" fill="#c3c2b7">Prefill, 3.3k-token prompt</text>
+<line x1="526.3" y1="70" x2="544.3" y2="70" stroke="#199e70" stroke-width="2.5" stroke-linecap="round"/>
+<text x="550.3" y="74" font-size="12" fill="#c3c2b7">Decode, 1 user</text>
+<line x1="58" y1="362.0" x2="684" y2="362.0" stroke="#3d424a" stroke-width="1"/>
+<text x="50" y="366.0" font-size="12" text-anchor="end" fill="#9a988f">1×</text>
+<line x1="58" y1="317.0" x2="684" y2="317.0" stroke="#262a30" stroke-width="1"/>
+<text x="50" y="321.0" font-size="12" text-anchor="end" fill="#9a988f">1.5×</text>
+<line x1="58" y1="272.0" x2="684" y2="272.0" stroke="#262a30" stroke-width="1"/>
+<text x="50" y="276.0" font-size="12" text-anchor="end" fill="#9a988f">2×</text>
+<line x1="58" y1="227.0" x2="684" y2="227.0" stroke="#262a30" stroke-width="1"/>
+<text x="50" y="231.0" font-size="12" text-anchor="end" fill="#9a988f">2.5×</text>
+<line x1="58" y1="182.0" x2="684" y2="182.0" stroke="#262a30" stroke-width="1"/>
+<text x="50" y="186.0" font-size="12" text-anchor="end" fill="#9a988f">3×</text>
+<line x1="58" y1="137.0" x2="684" y2="137.0" stroke="#262a30" stroke-width="1"/>
+<text x="50" y="141.0" font-size="12" text-anchor="end" fill="#9a988f">3.5×</text>
+<line x1="58" y1="92.0" x2="684" y2="92.0" stroke="#262a30" stroke-width="1"/>
+<text x="50" y="96.0" font-size="12" text-anchor="end" fill="#9a988f">4×</text>
+<line x1="58.0" y1="362" x2="58.0" y2="366" stroke="#3d424a"/>
+<text transform="translate(61.0,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">stock</text>
+<line x1="114.9" y1="362" x2="114.9" y2="366" stroke="#3d424a"/>
+<text transform="translate(117.9,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">1 day-1 fusions</text>
+<line x1="171.8" y1="362" x2="171.8" y2="366" stroke="#3d424a"/>
+<text transform="translate(174.8,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">2 NVFP4 experts</text>
+<line x1="228.7" y1="362" x2="228.7" y2="366" stroke="#3d424a"/>
+<text transform="translate(231.7,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">3 prompt batches</text>
+<line x1="285.6" y1="362" x2="285.6" y2="366" stroke="#3d424a"/>
+<text transform="translate(288.6,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">4 2-user fusions</text>
+<line x1="342.5" y1="362" x2="342.5" y2="366" stroke="#3d424a"/>
+<text transform="translate(345.5,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">5 short conv</text>
+<line x1="399.5" y1="362" x2="399.5" y2="366" stroke="#3d424a"/>
+<text transform="translate(402.5,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">6 narrow tiles</text>
+<line x1="456.4" y1="362" x2="456.4" y2="366" stroke="#3d424a"/>
+<text transform="translate(459.4,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">7–8 expert tiles</text>
+<line x1="513.3" y1="362" x2="513.3" y2="366" stroke="#3d424a"/>
+<text transform="translate(516.3,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">9 FA tiles</text>
+<line x1="570.2" y1="362" x2="570.2" y2="366" stroke="#3d424a"/>
+<text transform="translate(573.2,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">10–11 mask + block scan</text>
+<line x1="627.1" y1="362" x2="627.1" y2="366" stroke="#3d424a"/>
+<text transform="translate(630.1,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">12 expert rows</text>
+<line x1="684.0" y1="362" x2="684.0" y2="366" stroke="#3d424a"/>
+<text transform="translate(687.0,376) rotate(-35)" font-size="12" text-anchor="end" fill="#c3c2b7">13 short batches</text>
+<polyline points="58.0,362.0 114.9,331.2 171.8,300.4 228.7,300.2 285.6,300.1 342.5,299.5 399.5,299.3 456.4,299.5 513.3,299.6 570.2,299.3 627.1,299.4 684.0,299.6" fill="none" stroke="#199e70" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="58.0" cy="362.0" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="114.9" cy="331.2" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="171.8" cy="300.4" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="228.7" cy="300.2" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="285.6" cy="300.1" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="342.5" cy="299.5" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="399.5" cy="299.3" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="456.4" cy="299.5" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="513.3" cy="299.6" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="570.2" cy="299.3" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="627.1" cy="299.4" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<circle cx="684.0" cy="299.6" r="4" fill="#199e70" stroke="#0d1117" stroke-width="2"/>
+<polyline points="58.0,362.0 114.9,321.1 171.8,249.9 228.7,214.8 285.6,215.2 342.5,207.3 399.5,202.1 456.4,197.6 513.3,190.8 570.2,178.6 627.1,174.3 684.0,174.6" fill="none" stroke="#d95926" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="58.0" cy="362.0" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="114.9" cy="321.1" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="171.8" cy="249.9" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="228.7" cy="214.8" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="285.6" cy="215.2" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="342.5" cy="207.3" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="399.5" cy="202.1" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="456.4" cy="197.6" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="513.3" cy="190.8" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="570.2" cy="178.6" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="627.1" cy="174.3" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<circle cx="684.0" cy="174.6" r="4" fill="#d95926" stroke="#0d1117" stroke-width="2"/>
+<polyline points="58.0,362.0 114.9,319.2 171.8,211.2 228.7,168.2 285.6,169.0 342.5,159.3 399.5,153.7 456.4,147.5 513.3,136.3 570.2,119.1 627.1,114.4 684.0,113.7" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="58.0" cy="362.0" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="114.9" cy="319.2" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="171.8" cy="211.2" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="228.7" cy="168.2" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="285.6" cy="169.0" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="342.5" cy="159.3" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="399.5" cy="153.7" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="456.4" cy="147.5" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="513.3" cy="136.3" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="570.2" cy="119.1" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="627.1" cy="114.4" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<circle cx="684.0" cy="113.7" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"/>
+<line x1="698" y1="109.7" x2="710" y2="109.7" stroke="#3987e5" stroke-width="2.5" stroke-linecap="round"/>
+<text x="716" y="113.7" font-size="14" font-weight="600" fill="#f0efec">1166 t/s</text>
+<text x="716" y="128.7" font-size="12" fill="#c3c2b7">prefill, 12.9k prompt</text>
+<line x1="698" y1="170.6" x2="710" y2="170.6" stroke="#d95926" stroke-width="2.5" stroke-linecap="round"/>
+<text x="716" y="174.6" font-size="14" font-weight="600" fill="#f0efec">1185 t/s</text>
+<text x="716" y="189.6" font-size="12" fill="#c3c2b7">prefill, 3.3k prompt</text>
+<line x1="698" y1="295.6" x2="710" y2="295.6" stroke="#199e70" stroke-width="2.5" stroke-linecap="round"/>
+<text x="716" y="299.6" font-size="14" font-weight="600" fill="#f0efec">49.2 t/s</text>
+<text x="716" y="314.6" font-size="12" fill="#c3c2b7">decode, 1 user</text>
+</svg>

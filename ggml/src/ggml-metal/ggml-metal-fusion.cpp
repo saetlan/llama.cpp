@@ -286,6 +286,1163 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+// situ(gate, up) = (b*tanh(gate/b) + 0)*sigmoid(gate) * (lb*tanh(up/lb) + 0), as built by build_moe_ffn (LLM_FFN_SITU):
+// SCALE(g) TANH SCALE SIGMOID(g) MUL SCALE(u) TANH SCALE MUL. Two branches, so the generic chain check does not apply
+// (unsafe = true) and the whole validation lives here.
+static bool ggml_metal_fusion_check_situ(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * s1  = nodes[0];
+    const ggml_tensor * t1  = nodes[1];
+    const ggml_tensor * s2  = nodes[2];
+    const ggml_tensor * sg  = nodes[3];
+    const ggml_tensor * act = nodes[4];
+    const ggml_tensor * s3  = nodes[5];
+    const ggml_tensor * t2  = nodes[6];
+    const ggml_tensor * s4  = nodes[7];
+    const ggml_tensor * out = nodes[8];
+
+    if (ggml_get_unary_op(t1) != GGML_UNARY_OP_TANH || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(t2) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+
+    const ggml_tensor * g = s1->src[0];
+    const ggml_tensor * u = s3->src[0];
+
+    const bool wired =
+        t1->src[0] == s1 && s2->src[0] == t1 && sg->src[0] == g &&
+        ((act->src[0] == s2 && act->src[1] == sg) || (act->src[0] == sg && act->src[1] == s2)) &&
+        t2->src[0] == s3 && s4->src[0] == t2 &&
+        ((out->src[0] == act && out->src[1] == s4) || (out->src[0] == s4 && out->src[1] == act));
+    if (!wired || g == nullptr || u == nullptr) {
+        return false;
+    }
+
+    // everything F32 and element-wise over one [ne0, ne1, ne2] shape; the kernel walks g and u by row strides
+    const ggml_tensor * all[] = { g, u, s1, t1, s2, sg, act, s3, t2, s4, out };
+    for (const ggml_tensor * t : all) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, out)) {
+            return false;
+        }
+    }
+    if (out->ne[3] != 1 || out->ne[0] % 4 != 0 || !ggml_is_contiguous_rows(g) || !ggml_is_contiguous_rows(u) ||
+        !ggml_is_contiguous(out) || g->nb[1] % 16 != 0 || g->nb[2] % 16 != 0 || u->nb[1] % 16 != 0 ||
+        u->nb[2] % 16 != 0 || (u->view_offs % 16) != 0 || (g->view_offs % 16) != 0) {
+        return false;
+    }
+
+    // out is written in its own layout while g and u are read in theirs (row stride 2*ne0): any overlap with the
+    // tensor they view is a race, including the in-place case that the generic range check treats as safe
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(out, root(g)) || overlap(out, root(u))) {
+            return false;
+        }
+    }
+
+    // only out leaves the group
+    int outputs[1] = { node_idxs[idx + 8] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 9, fusion->ops.data(), outputs, 1);
+}
+
+// row L2-norm clip, as built by inkling2 clip(): y = x*clamp(thr/(sqrt(sum(x*x)) + eps), lo, hi), with an optional
+// per-channel scale x = cur*scale in front. Validated here (unsafe = true): x feeds both SQR and the last MUL.
+static bool ggml_metal_fusion_check_clip_rows(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const int  n     = (int) fusion->ops.size();
+    const bool scaled = n == 9;
+    const int  o     = scaled ? 1 : 0;
+
+    const ggml_tensor * mul0  = scaled ? nodes[0] : nullptr;
+    const ggml_tensor * sq    = nodes[o + 0];
+    const ggml_tensor * sr    = nodes[o + 1];
+    const ggml_tensor * rt    = nodes[o + 2];
+    const ggml_tensor * sc    = nodes[o + 3];
+    const ggml_tensor * fill  = nodes[o + 4];
+    const ggml_tensor * div   = nodes[o + 5];
+    const ggml_tensor * clamp = nodes[o + 6];
+    const ggml_tensor * out   = nodes[o + 7];
+
+    const ggml_tensor * x = scaled ? mul0 : sq->src[0];
+    if (x == nullptr) {
+        return false;
+    }
+
+    const bool wired =
+        sq->src[0] == x && sr->src[0] == sq && rt->src[0] == sr && sc->src[0] == rt && fill->src[0] == sc &&
+        div->src[0] == fill && div->src[1] == sc && clamp->src[0] == div &&
+        out->src[0] == x && out->src[1] == clamp;
+    if (!wired) {
+        return false;
+    }
+
+    const ggml_tensor * cur   = scaled ? mul0->src[0] : x;
+    const ggml_tensor * scale = scaled ? mul0->src[1] : nullptr;
+
+    // F32 rows of a multiple of 4 floats, at most 32 float4 (one SIMD group per row, like kernel_sum_rows_f32_f32_4)
+    const ggml_tensor * f32s[] = { cur, x, sq, sr, rt, sc, fill, div, clamp, out };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (x->ne[0] % 4 != 0 || x->ne[0] > 128 || x->ne[3] != 1 || !ggml_are_same_shape(x, out) ||
+        !ggml_are_same_shape(cur, x) || !ggml_are_same_shape(x, sq) ||
+        sr->ne[0] != 1 || sr->ne[1] != x->ne[1] || sr->ne[2] != x->ne[2] ||
+        !ggml_are_same_shape(sr, rt) || !ggml_are_same_shape(sr, sc) || !ggml_are_same_shape(sr, fill) ||
+        !ggml_are_same_shape(sr, div) || !ggml_are_same_shape(sr, clamp) ||
+        !ggml_is_contiguous_rows(cur) || !ggml_is_contiguous(out)) {
+        return false;
+    }
+    if (scaled) {
+        if (scale->type != GGML_TYPE_F32 || scale->ne[0] != x->ne[0] || scale->ne[1] != x->ne[1] ||
+            scale->ne[2] != 1 || scale->ne[3] != 1 || !ggml_is_contiguous(scale) || mul0->src[0] != cur) {
+            return false;
+        }
+    }
+
+    int outputs[1] = { node_idxs[idx + n - 1] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n, fusion->ops.data(), outputs, 1);
+}
+
+// inkling2 control(): out = (c - tanh(f)*c) + tanh(g)*m, as TANH(f) MUL SUB TANH(g) MUL ADD (validated here, unsafe = true)
+static bool ggml_metal_fusion_check_ctrl_mix(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * tf = nodes[0];
+    const ggml_tensor * m1 = nodes[1];
+    const ggml_tensor * sb = nodes[2];
+    const ggml_tensor * tg = nodes[3];
+    const ggml_tensor * m2 = nodes[4];
+    const ggml_tensor * ad = nodes[5];
+
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    // the kernel computes forget*c, gain*m and sub + mul in exactly these operand orders
+    if (m1->src[0] != tf || sb->src[1] != m1 || m1->src[1] != sb->src[0] || m2->src[0] != tg ||
+        ad->src[0] != sb || ad->src[1] != m2) {
+        return false;
+    }
+
+    const ggml_tensor * c = sb->src[0];
+    const ggml_tensor * m = m2->src[1];
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+
+    const ggml_tensor * all[] = { c, m, f, g, tf, m1, sb, tg, m2, ad };
+    for (const ggml_tensor * t : all) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, ad)) {
+            return false;
+        }
+    }
+    if (ad->ne[2] != 1 || ad->ne[3] != 1 || !ggml_is_contiguous_rows(c) || !ggml_is_contiguous_rows(m) ||
+        !ggml_is_contiguous_rows(f) || !ggml_is_contiguous_rows(g) || !ggml_is_contiguous(ad)) {
+        return false;
+    }
+
+    int outputs[1] = { node_idxs[idx + 5] };
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 6, fusion->ops.data(), outputs, 1);
+}
+
+// inkling2 convolve() without dynamic taps, n_conv = 4:
+//   x = concat(past, cur^T, 0); state <- x[last 3]; out = (cur + ssm_conv(x, w))*scale
+// raw: CONCAT VIEW(last) VIEW(cell) CPY SSM_CONV RESHAPE ADD SCALE. The CPY writes through a view of the recurrent
+// state, which the generic subgraph check rejects, so the use counts are checked here directly.
+static bool ggml_metal_fusion_check_sconv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const bool has_res = fusion->ops.size() == 6;
+    const ggml_tensor * cat  = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+    const ggml_tensor * conv = nodes[2];
+    const ggml_tensor * add  = nodes[3];
+    const ggml_tensor * scl  = nodes[4];
+    const ggml_tensor * res  = has_res ? nodes[5] : nullptr;
+    const ggml_tensor * out  = has_res ? res : scl;
+
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + (has_res ? 5 : 4)];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * last = gf->nodes[r0 + 1];
+    const ggml_tensor * cell = gf->nodes[r0 + 2];
+    const ggml_tensor * outv = gf->nodes[r0 + 5];
+
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * xt   = cat->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * cur  = add->src[0];
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || last->view_src != cat || cpy->src[0] != last || cpy->src[1] != cell ||
+        conv->src[0] != cat || outv->src[0] != conv || add->src[1] != outv || scl->src[0] != add) {
+        return false;
+    }
+    // residual: out = resid + scl (either operand order), same shape, contiguous
+    const ggml_tensor * resid = nullptr;
+    if (has_res) {
+        resid = res->src[0] == scl ? res->src[1] : res->src[0];
+        if ((res->src[0] != scl && res->src[1] != scl) || resid == nullptr || resid->type != GGML_TYPE_F32 ||
+            res->type != GGML_TYPE_F32 || !ggml_are_same_shape(res, scl) || !ggml_are_same_shape(resid, scl) ||
+            !ggml_is_contiguous(res) || !ggml_is_contiguous(resid)) {
+            return false;
+        }
+    }
+
+    const int64_t nc = 4;
+    const int64_t C  = cat->ne[1];
+    const int64_t S  = cat->ne[2];
+    const int64_t T  = xt->ne[0];
+
+    const ggml_tensor * f32s[] = { cat, past, xt, w, cur, conv, add, scl, cell };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (past->ne[0] != nc - 1 || past->ne[1] != C || past->ne[2] != S || xt->ne[1] != C || xt->ne[2] != S ||
+        cat->ne[0] != nc - 1 + T || cat->ne[3] != 1 || w->ne[0] != nc || w->ne[1] != C || !ggml_is_contiguous(w) ||
+        !ggml_is_contiguous(cat) || last->ne[0] != nc - 1 || last->ne[1] != C || last->ne[2] != S ||
+        last->view_offs != (size_t) T*sizeof(float) || cell->ne[0] != (nc - 1)*C || cell->ne[1] != S ||
+        cell->nb[0] != sizeof(float) || conv->ne[0] != C || conv->ne[1] != T || conv->ne[2] != S ||
+        cur->ne[0] != C || cur->ne[1] != T*S || !ggml_is_contiguous(cur) || !ggml_is_contiguous(scl) ||
+        !ggml_are_same_shape(add, scl) || !ggml_are_same_shape(add, cur) || past->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // xt is cur^T: element (t, c, s) at cur + (s*T + t)*row + c*4
+    if (xt->data != cur->data && mode == GGML_METAL_FUSION_FULL) {
+        return false;
+    }
+    // the token strides only matter for prompt batches (one token: cur may be a row view of a packed product)
+    if (xt->nb[1] != sizeof(float) || (T > 1 && (xt->nb[0] != cur->nb[1] || xt->nb[2] != T*cur->nb[1]))) {
+        return false;
+    }
+
+    // every node except the output (and the side-effect CPY) is consumed only inside the group
+    for (int r = r0; r <= r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node == out || node == cpy) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+    if (ggml_node_get_use_count(gf, r0 + 3) != 0) {
+        return false;
+    }
+
+    // the kernel writes out and the state; out may only alias cur element for element (in place)
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // out is written element for element in the layout of cur (and of resid): only an exact in-place alias is safe
+        if (overlap(out, root(past)) || overlap(out, root(w)) || overlap(out, root(cell)) ||
+            overlap(cell, root(past)) || overlap(cell, root(cur)) ||
+            (overlap(out, root(cur)) && (out->data != cur->data || T > 1)) ||
+            (resid && overlap(cell, root(resid))) ||
+            (resid && overlap(out, root(resid)) && out->data != resid->data)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// inkling2 rel-pos bias into the per-head flash-attention mask:
+//   table = bias_pad^T R - sinks; kq_b = table[:, rel_pos]; mask16 = f16(kq_b + mask)
+// raw: MUL_MAT RESHAPE SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT ADD CPY
+static bool ggml_metal_fusion_check_relpos(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * mm    = nodes[0];
+    const ggml_tensor * sub   = nodes[1];
+    const ggml_tensor * cont1 = nodes[2];
+    const ggml_tensor * gr    = nodes[3];
+    const ggml_tensor * cont2 = nodes[4];
+    const ggml_tensor * add   = nodes[5];
+    const ggml_tensor * cpy   = nodes[6];
+
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 6];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * sinks_r = gf->nodes[r0 + 1];
+    const ggml_tensor * perm1   = gf->nodes[r0 + 3];
+    const ggml_tensor * resh2   = gf->nodes[r0 + 6];
+    const ggml_tensor * perm2   = gf->nodes[r0 + 7];
+
+    const ggml_tensor * bias  = mm->src[0];
+    const ggml_tensor * R     = mm->src[1];
+    const ggml_tensor * sinks = sinks_r->src[0];
+    const ggml_tensor * relp  = gr->src[1];
+    const ggml_tensor * mask  = add->src[1];
+
+    if (sub->src[0] != mm || sub->src[1] != sinks_r || perm1->src[0] != sub || cont1->src[0] != perm1 ||
+        gr->src[0] != cont1 || resh2->src[0] != gr || perm2->src[0] != resh2 || cont2->src[0] != perm2 ||
+        add->src[0] != cont2 || cpy->src[0] != add || cpy->src[1] != cpy || sinks == nullptr) {
+        return false;
+    }
+
+    const int64_t NR = bias->ne[0];   // relative features (16)
+    const int64_t Ep = bias->ne[1];   // table rows (extent + 1)
+    const int64_t H  = R->ne[1];
+    const int64_t T  = R->ne[2];
+    const int64_t NK = relp->ne[0];
+
+    if (bias->type != GGML_TYPE_F32 || R->type != GGML_TYPE_F32 || sinks->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F32 ||
+        relp->type != GGML_TYPE_I32 || cpy->type != GGML_TYPE_F16 || add->type != GGML_TYPE_F32 ||
+        R->ne[0] != NR || NR > 32 || !ggml_is_contiguous(bias) || !ggml_is_contiguous_rows(R) ||
+        sinks->ne[0] != H || sinks->ne[1] != T || !ggml_is_contiguous_rows(sinks) ||
+        relp->ne[1] != T || relp->nb[0] != sizeof(int32_t) || mm->ne[0] != Ep || mm->ne[1] != H || mm->ne[2] != T ||
+        cpy->ne[0] != NK || cpy->ne[2] != H || cpy->ne[1]*cpy->ne[3] != T || !ggml_is_contiguous(cpy) ||
+        !ggml_are_same_shape(add, cpy) || mask->ne[0] != NK || mask->nb[0] != sizeof(float) ||
+        (mask->ne[1] != 1 && mask->ne[1] != cpy->ne[1]) || mask->ne[2] != 1 || (mask->ne[3] != 1 && mask->ne[3] != cpy->ne[3])) {
+        return false;
+    }
+    // the permutes are the ones inkling2 builds: (1,0,2,3) on the table, (2,0,1,3) on the gathered rows
+    if (cont1->ne[0] != H || cont1->ne[1] != Ep || gr->ne[0] != H || gr->ne[1] != NK || cont2->ne[0] != NK ||
+        cont2->ne[2] != H) {
+        return false;
+    }
+
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        const ggml_tensor * ins[] = { bias, R, sinks, relp, mask };
+        for (const ggml_tensor * t : ins) {
+            if (overlap(cpy, root(t))) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// inkling2 mix() at one token: raw TRANSPOSE CONT RESHAPE MUL_MAT SOFT_MAX MUL_MAT. The scores product runs as is;
+// the transposed copy, the softmax and the second product become one kernel that reads the states directly.
+static bool ggml_metal_fusion_check_mix_tail(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * cont = nodes[0];
+    const ggml_tensor * mm1  = nodes[1];
+    const ggml_tensor * sm   = nodes[2];
+    const ggml_tensor * mm2  = nodes[3];
+
+    // the leading TRANSPOSE is a view: the optimizer packs it alone and may move it, so the raw range checked here
+    // starts at the CONT (ops_all[1..]) and the transpose is found through the CONT
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 3];
+    if (r1 - r0 + 2 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 1; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * tr     = cont->src[0];
+    const ggml_tensor * qv     = gf->nodes[r0 + 1];
+    const ggml_tensor * states = mm1->src[0];
+
+    if (tr == nullptr || tr->op != GGML_OP_TRANSPOSE || tr->src[0] != states || mm1->src[1] != qv || sm->src[0] != mm1 ||
+        sm->src[1] != nullptr || mm2->src[0] != cont || mm2->src[1] != sm || qv->view_src == nullptr) {
+        return false;
+    }
+    float max_bias;
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+
+    const ggml_tensor * f32s[] = { states, qv, cont, mm1, sm, mm2 };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t E = states->ne[0], nr = states->ne[1], T = states->ne[2];
+    if (max_bias != 0.0f || T != 1 || nr < 1 || nr > 8 || states->ne[3] != 1 || !ggml_is_contiguous_rows(states) ||
+        mm1->ne[0] != nr || mm2->ne[0] != E || mm2->ne[2] != T || !ggml_is_contiguous(mm2) || !ggml_is_contiguous(mm1) ||
+        sm->ne[0] != nr || !ggml_is_contiguous(sm)) {
+        return false;
+    }
+
+    // the copy, the softmax and the scores are consumed only inside the group (the scores by the softmax)
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // the kernel reads the states and the scores (mm1) while writing mm2
+        if (overlap(mm2, root(states)) || overlap(mm2, mm1)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// inkling2 mix() for a batch of tokens: raw TRANSPOSE CONT MUL_MAT SOFT_MAX MUL_MAT, the queries being a REPEAT made
+// elsewhere. Same kernels as the general one-token path, with the token as grid z: per token and query, the softmax
+// and the second product (an F32 matvec over nr <= 8 terms) keep the arithmetic of the separate kernels.
+static bool ggml_metal_fusion_check_mix_tail_t(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    static const bool disabled = getenv("GGML_METAL_MIX_TAILT_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * cont = nodes[0];
+    const ggml_tensor * mm1  = nodes[1];
+    const ggml_tensor * sm   = nodes[2];
+    const ggml_tensor * mm2  = nodes[3];
+
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 3];
+    if (r1 - r0 + 2 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 1; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * tr     = cont->src[0];
+    const ggml_tensor * states = mm1->src[0];
+    const ggml_tensor * qy     = mm1->src[1];
+
+    if (tr == nullptr || tr->op != GGML_OP_TRANSPOSE || tr->src[0] != states || qy == nullptr || sm->src[0] != mm1 ||
+        sm->src[1] != nullptr || mm2->src[0] != cont || mm2->src[1] != sm) {
+        return false;
+    }
+    float max_bias;
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+
+    const ggml_tensor * f32s[] = { states, qy, cont, mm1, sm, mm2 };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t E = states->ne[0], nr = states->ne[1], T = states->ne[2];
+    const int64_t nq = mm2->ne[1];
+    if (max_bias != 0.0f || T < 2 || nr < 1 || nr > 8 || states->ne[3] != 1 || !ggml_is_contiguous_rows(states) ||
+        mm1->ne[0] != nr || mm1->ne[1] != nq || mm1->ne[2] != T || mm1->ne[3] != 1 ||
+        mm2->ne[0] != E || mm2->ne[2] != T || mm2->ne[3] != 1 || !ggml_is_contiguous(mm2) || !ggml_is_contiguous(mm1) ||
+        sm->ne[0] != nr || !ggml_is_contiguous(sm) || qy->ne[0] != E || qy->ne[1] != nq || qy->ne[2] != T) {
+        return false;
+    }
+
+    // the copy, the scores and the softmax are consumed only inside the group
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // the tail kernel reads the states and the scores (mm1) while writing mm2
+        if (overlap(mm2, root(states)) || overlap(mm2, mm1)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// out = c * sigmoid(g), as UNARY(sigmoid) MUL (inkling2 attention output gate)
+static bool ggml_metal_fusion_check_gate_mul(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion); GGML_UNUSED(gf); GGML_UNUSED(node_idxs); GGML_UNUSED(idx); GGML_UNUSED(mode);
+    const ggml_tensor * sg  = nodes[0];
+    const ggml_tensor * mul = nodes[1];
+    if (ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID || mul->src[1] != sg) {
+        return false;
+    }
+    const ggml_tensor * c = mul->src[0];
+    const ggml_tensor * g = sg->src[0];
+    return c->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && sg->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(c, mul) && ggml_are_same_shape(g, mul) && ggml_is_contiguous(c) && ggml_is_contiguous(g) &&
+        ggml_is_contiguous(mul) && ggml_nelements(mul) % 4 == 0;
+}
+
+// inkling2 convolve() with dynamic taps (n_conv = 4): x = concat(past, cur^T); state <- x[last 3];
+// out = ssm_conv(x, w); for lag: out += x_window(lag) * tap(lag, head); res = (cur + out)*scale. Validated here.
+static bool ggml_metal_fusion_check_sconv_dyn(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n = (int) fusion->ops.size();   // 17
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + n - 1];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * cat  = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+    const ggml_tensor * conv = nodes[2];
+    const ggml_tensor * addc = nodes[n - 2];
+    const ggml_tensor * scl  = nodes[n - 1];
+    const ggml_tensor * last = gf->nodes[r0 + 1];
+    const ggml_tensor * cell = gf->nodes[r0 + 2];
+    const ggml_tensor * outv = gf->nodes[r0 + 5];
+
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * xt   = cat->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * cur  = addc->src[0];
+
+    if (ggml_get_op_params_i32(cat, 0) != 0 || last->view_src != cat || cpy->src[0] != last || cpy->src[1] != cell ||
+        conv->src[0] != cat || outv->src[0] != conv || scl->src[0] != addc) {
+        return false;
+    }
+    const int64_t C = cat->ne[1], S = cat->ne[2], T = xt->ne[0];
+    // one thread per (channel, sequence) loops over the tokens; GGML_METAL_SCONV_DYN_MAXT caps T (default: decode and
+    // small batches only, where the unfused chain is many tiny dispatches)
+    static const int64_t max_t = getenv("GGML_METAL_SCONV_DYN_MAXT") ? atoll(getenv("GGML_METAL_SCONV_DYN_MAXT")) : 64;
+    if (T < 1 || S < 1 || T > max_t) {
+        return false;
+    }
+
+    // the tap chain: per lag, a CONT of a transposed window view of x, a MUL by a tap view of the projection, an ADD
+    const ggml_tensor * acc = outv;
+    const ggml_tensor * dyn = nullptr;
+    for (int lag = 0; lag < 4; ++lag) {
+        const ggml_tensor * ct  = nodes[3 + 3*lag];
+        const ggml_tensor * mul = nodes[4 + 3*lag];
+        const ggml_tensor * ad  = nodes[5 + 3*lag];
+        const ggml_tensor * tr  = ct->src[0];
+        const ggml_tensor * win = tr ? tr->src[0] : nullptr;
+        if (!tr || tr->op != GGML_OP_TRANSPOSE || !win || win->op != GGML_OP_VIEW || win->view_src != cat ||
+            win->view_offs != (size_t) (3 - lag)*sizeof(float)) {
+            return false;
+        }
+        const ggml_tensor * mw = mul->src[0]; // reshape of the window copy
+        const ggml_tensor * tp = mul->src[1]; // tap view
+        if (!mw || mw->op != GGML_OP_RESHAPE || mw->src[0] != ct || !tp || tp->op != GGML_OP_VIEW) {
+            return false;
+        }
+        const ggml_tensor * d3 = tp->src[0];  // reshape_3d of the projection (itself possibly a view of a packed product)
+        if (!d3 || d3->op != GGML_OP_RESHAPE || d3->ne[0] != 4 || tp->view_offs != d3->view_offs + (size_t) lag*sizeof(float)) {
+            return false;
+        }
+        if (dyn == nullptr) {
+            dyn = d3;
+        } else if (d3 != dyn) {
+            return false;
+        }
+        const ggml_tensor * term = ad->src[1];
+        if (ad->src[0] != acc || !term || term->op != GGML_OP_RESHAPE || term->src[0] != mul) {
+            return false;
+        }
+        acc = ad;
+    }
+    if (addc->src[1] != acc) {
+        return false;
+    }
+    const int64_t H = dyn->ne[1];
+    if (H < 1 || C % H != 0) {
+        return false;
+    }
+
+    const ggml_tensor * f32s[] = { cat, past, xt, w, cur, conv, addc, scl, cell, dyn };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (past->ne[0] != 3 || past->ne[1] != C || cat->ne[0] != 3 + T || w->ne[0] != 4 || w->ne[1] != C ||
+        !ggml_is_contiguous(w) || !ggml_is_contiguous(cat) || last->view_offs != (size_t) T*sizeof(float) ||
+        cell->ne[0] != 3*C || cell->nb[0] != sizeof(float) || cur->ne[0] != C || cur->ne[1] != T*S ||
+        !ggml_is_contiguous(cur) || !ggml_is_contiguous(scl) || past->nb[0] != sizeof(float) ||
+        dyn->ne[2] != T*S || dyn->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL && xt->data != cur->data) {
+        return false;
+    }
+
+    for (int r = r0; r <= r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node == scl || node == cpy) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(scl, root(past)) || overlap(scl, root(w)) || overlap(scl, root(cell)) || overlap(scl, root(dyn)) ||
+            overlap(cell, root(past)) || overlap(cell, root(cur)) || overlap(cell, root(dyn)) ||
+            (overlap(scl, root(cur)) && scl->data != cur->data)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// common tail of the store fusions: nodes[k] is the SET_ROWS writing the rows of `val` (via a 2D VIEW) into an f16
+// cache at the given row indices; every raw node in [r0, r1] except the SET_ROWS is consumed inside the group
+static bool ggml_metal_fusion_check_store_tail(const ggml_tensor * val, const ggml_tensor * sr, const ggml_cgraph * gf,
+        int r0, int r1) {
+    const ggml_tensor * vw = gf->nodes[r1 - 1];
+    if (sr != gf->nodes[r1] || vw->op != GGML_OP_VIEW || vw->view_src != val || vw->view_offs != 0 || sr->src[0] != vw) {
+        return false;
+    }
+    const ggml_tensor * idxs  = sr->src[1];
+    const ggml_tensor * cache = sr->src[2];
+    if (!idxs || !cache || (idxs->type != GGML_TYPE_I64 && idxs->type != GGML_TYPE_I32) || cache->type != GGML_TYPE_F16 ||
+        vw->ne[0] != val->ne[0]*val->ne[1] || vw->ne[1] != val->ne[2] || vw->nb[1] != val->nb[2] ||
+        cache->ne[0] != vw->ne[0] || cache->nb[0] != sizeof(ggml_fp16_t) || idxs->ne[0] != vw->ne[1] ||
+        sr->ne[2] != 1 || sr->ne[3] != 1 || idxs->ne[1] != 1 || !ggml_is_contiguous(val)) {
+        return false;
+    }
+    for (int r = r0; r < r1; ++r) {
+        const ggml_tensor * node = gf->nodes[r];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int q = r + 1; q <= r1; ++q) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += gf->nodes[q]->src[s] == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(gf, r)) {
+            return false;
+        }
+    }
+    return ggml_node_get_use_count(gf, r1) == 0;
+}
+
+// raw: SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL VIEW SET_ROWS (the K clip of inkling2, then the K cache store)
+static bool ggml_metal_fusion_check_clip_store(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 8];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * sq = nodes[0], * sr = nodes[1], * rt = nodes[2], * sc = nodes[3], * fill = nodes[4];
+    const ggml_tensor * div = nodes[5], * clamp = nodes[6], * out = nodes[7];
+    const ggml_tensor * x = sq->src[0];
+    if (!x || sr->src[0] != sq || rt->src[0] != sr || sc->src[0] != rt || fill->src[0] != sc || div->src[0] != fill ||
+        div->src[1] != sc || clamp->src[0] != div || out->src[0] != x || out->src[1] != clamp) {
+        return false;
+    }
+    const ggml_tensor * f32s[] = { x, sq, sr, rt, sc, fill, div, clamp, out };
+    for (const ggml_tensor * t : f32s) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (x->ne[0] % 4 != 0 || x->ne[0] > 128 || x->ne[3] != 1 || !ggml_are_same_shape(x, out) || !ggml_is_contiguous_rows(x) ||
+        sr->ne[0] != 1 || sr->ne[1] != x->ne[1] || sr->ne[2] != x->ne[2]) {
+        return false;
+    }
+    return ggml_metal_fusion_check_store_tail(out, nodes[8], gf, r0, r1);
+}
+
+// raw: RMS_NORM VIEW SET_ROWS (the V norm of inkling2, then the V cache store)
+static bool ggml_metal_fusion_check_norm_store(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+    const int r0 = node_idxs[idx];
+    const int r1 = node_idxs[idx + 1];
+    if (r1 - r0 + 1 != (int) fusion->ops_all.size()) {
+        return false;
+    }
+    for (int r = r0, j = 0; r <= r1; ++r, ++j) {
+        if (gf->nodes[r]->op != fusion->ops_all[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * nrm = nodes[0];
+    const ggml_tensor * x   = nrm->src[0];
+    if (!x || x->type != GGML_TYPE_F32 || nrm->type != GGML_TYPE_F32 || nrm->src[1] != nullptr ||
+        x->ne[0] != 128 || x->ne[3] != 1 || !ggml_is_contiguous_rows(x) || !ggml_are_same_shape(x, nrm)) {
+        return false;
+    }
+    return ggml_metal_fusion_check_store_tail(nrm, nodes[1], gf, r0, r1);
+}
+
+// res*scale[ids] after an NVFP4 MUL_MAT_ID on the matvec path (llm_graph_context::build_lora_mm_id with w_s):
+// nodes = MUL_MAT_ID, [REPEAT], GET_ROWS, MUL; the scale is read straight from w_s by expert id in the kernel
+static bool ggml_metal_fusion_check_mv_id_scale(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n = (int) fusion->ops.size(); // 3 or 4
+    const ggml_tensor * mm  = nodes[0];
+    const ggml_tensor * gr  = nodes[n - 2];
+    const ggml_tensor * mul = nodes[n - 1];
+    const ggml_tensor * ids = mm->src[2];
+
+    static const bool mm_off = getenv("GGML_METAL_MMID_SCALE_DISABLE") != nullptr;
+    if (mm->src[0]->type != GGML_TYPE_NVFP4 || mm->src[1]->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        (mm_off && ggml_metal_op_mul_mat_id_use_mm(mm, true)) ||
+        !ggml_is_contiguous(mm) || mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (gr->src[1] != ids || mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, mm) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    if (!((mul->src[0] == mm && mul->src[1] == gr) || (mul->src[0] == gr && mul->src[1] == mm))) {
+        return false;
+    }
+    // the scale vector: GET_ROWS reads RESHAPE(w_s) directly, or through REPEAT at more than one token
+    const ggml_tensor * sv = gr->src[0];
+    if (n == 4) {
+        const ggml_tensor * rp = nodes[1];
+        if (sv != rp || rp->op != GGML_OP_REPEAT) {
+            return false;
+        }
+        sv = rp->src[0];
+    }
+    if (sv->op != GGML_OP_RESHAPE || sv->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) ||
+        ggml_nelements(sv) != mm->src[0]->ne[2] || sv->ne[0] != 1) {
+        return false;
+    }
+    for (int i = 0; i < n - 1; ++i) { // only the MUL leaves the group
+        if (ggml_node_get_use_count(gf, node_idxs[idx + i]) != 1) {
+            return false;
+        }
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // mul is written while the activation and the ids are read
+        if (overlap(mul, root(mm->src[1])) || overlap(mul, root(ids))) {
+            return false;
+        }
+    }
+    GGML_UNUSED(gf);
+    return true;
+}
+
+// inkling2 mix_states: states = concat(block_stack, rms_norm(cur) as [E, 1, T], dim 1). The normed rows are a group
+// output too (norm_once shares them with later stacks), so the kernel writes both; unsafe = true, validated here
+static bool ggml_metal_fusion_check_norm_concat(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * nrm = nodes[0];
+    const ggml_tensor * cat = nodes[1];
+    const ggml_tensor * x   = nrm->src[0];
+    const ggml_tensor * stk = cat->src[0];
+    const ggml_tensor * nv  = cat->src[1];
+
+    auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+
+    if (ggml_get_op_params_i32(cat, 0) != 1 || root(nv) != nrm || (nv != nrm && nv->op != GGML_OP_RESHAPE)) {
+        return false;
+    }
+    const int64_t E = x->ne[0];
+    const int64_t T = x->ne[1];
+    if (x->type != GGML_TYPE_F32 || nrm->type != GGML_TYPE_F32 || stk->type != GGML_TYPE_F32 || cat->type != GGML_TYPE_F32 ||
+        E % 4 != 0 || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) || x->nb[1] % 16 != 0 ||
+        !ggml_is_contiguous(nrm) || !ggml_is_contiguous(cat) ||
+        stk->ne[0] != E || stk->ne[2] != T || stk->ne[3] != 1 || stk->nb[0] != sizeof(float) || stk->nb[1] % 16 != 0 ||
+        stk->nb[2] % 16 != 0 || cat->ne[0] != E || cat->ne[1] != stk->ne[1] + 1 || cat->ne[2] != T || cat->ne[3] != 1 ||
+        nv->ne[0] != E || nv->ne[1] != 1 || nv->ne[2] != T) {
+        return false;
+    }
+    if (cat->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        // cat is written while x and the stack are read; nrm is written while the stack is read
+        if (overlap(cat, root(x)) || overlap(cat, root(stk)) || overlap(cat, nrm) || overlap(nrm, root(stk))) {
+            return false;
+        }
+    }
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    return true;
+}
+
+// out = W^T [a; b] at one token, W F32 on the kernel_mul_mv_f32_f32_4 path (nsg 4, nr0 2): replicated exactly with the
+// vector read from a and b; requires the a|b boundary on a 16-float chunk boundary
+static bool ggml_metal_fusion_check_cat_mv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * cat = nodes[0];
+    const ggml_tensor * mm  = nodes[1];
+    if (mm->src[1] != cat || ggml_get_op_params_i32(cat, 0) != 0) {
+        return false;
+    }
+    const ggml_tensor * a = cat->src[0];
+    const ggml_tensor * b = cat->src[1];
+    const ggml_tensor * w = mm->src[0];
+    if (!a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || cat->type != GGML_TYPE_F32 ||
+        w->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        cat->ne[2] != 1 || cat->ne[3] != 1 || a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1 ||
+        a->ne[1] != cat->ne[1] || b->ne[1] != cat->ne[1] ||
+        a->ne[0] % 16 != 0 || b->ne[0] % 16 != 0 || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) ||
+        a->nb[1] % 16 != 0 || b->nb[1] % 16 != 0 ||
+        w->ne[0] != cat->ne[0] || w->ne[0] < 512 || w->ne[0] % 32 != 0 || w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != sizeof(float) ||
+        w->nb[1] % 16 != 0 || mm->ne[0] != w->ne[1] || mm->ne[1] != cat->ne[1] || mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    // one token: the f32_4 replica; 2..5 tokens: the mv_ext replica, only where the separate product takes mv_ext
+    static const bool t1_only = getenv("GGML_METAL_CAT_MV_T1") != nullptr;
+    const int64_t T = cat->ne[1];
+    if (T < 1 || T > 5 || (T > 1 && (t1_only || w->ne[0] % 128 != 0 || ggml_metal_op_mul_mat_use_mma(mm)))) {
+        return false;
+    }
+    if ((((uintptr_t) a->data) % 16) != 0 || (((uintptr_t) b->data) % 16) != 0) {
+        if (mode == GGML_METAL_FUSION_FULL) {
+            return false;
+        }
+    }
+    if (cat->flags & GGML_TENSOR_FLAG_OUTPUT || ggml_node_get_use_count(gf, node_idxs[idx]) != 1) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+            if (!x->data || !y->data) {
+                return false;
+            }
+            const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
+            const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
+            return x0 < y1 && y0 < x1;
+        };
+        if (overlap(mm, root(a)) || overlap(mm, root(b))) {
+            return false;
+        }
+    }
+    GGML_UNUSED(fusion);
+    return true;
+}
+
+// y = Wgf^T x (rows [gain | forget]) at one token, then out = cur - tanh(forget)*cur + tanh(gain)*message; the matvec is
+// on the kernel_mul_mv_f32_f32_4 path with nsg 1 (ne00 <= 128), replicated per row
+static bool ggml_metal_fusion_check_gf_ctrl(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const ggml_tensor * mm = nodes[0];
+    const ggml_tensor * tf = nodes[1];
+    const ggml_tensor * m1 = nodes[2];
+    const ggml_tensor * sb = nodes[3];
+    const ggml_tensor * tg = nodes[4];
+    const ggml_tensor * m2 = nodes[5];
+    const ggml_tensor * ad = nodes[6];
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    const ggml_tensor * fv = tf->src[0];
+    const ggml_tensor * gv = tg->src[0];
+    const ggml_tensor * x  = mm->src[1];
+    const ggml_tensor * w  = mm->src[0];
+    const int64_t E = ad->ne[0];
+    if (!fv || !gv || fv->view_src != mm || gv->view_src != mm || gv->view_offs != 0 || fv->view_offs != (size_t) E*sizeof(float)) {
+        return false;
+    }
+    const ggml_tensor * c = sb->src[0];
+    const bool wired = m1->src[0] == tf && m1->src[1] == c && sb->src[1] == m1 && m2->src[0] == tg &&
+                       ((ad->src[0] == sb && ad->src[1] == m2) || (ad->src[0] == m2 && ad->src[1] == sb));
+    if (!wired) {
+        return false;
+    }
+    const ggml_tensor * m = m2->src[1];
+    if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || ad->type != GGML_TYPE_F32 ||
+        c->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 ||
+        w->ne[0] < 32 || w->ne[0] > 128 || w->ne[0] % 32 != 0 || w->ne[1] != 2*E || w->ne[2] != 1 || w->nb[0] != sizeof(float) ||
+        w->nb[1] % 16 != 0 || x->ne[0] != w->ne[0] || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+        ad->ne[2] != 1 || !ggml_is_contiguous(ad) || c->ne[0] != E || m->ne[0] != E ||
+        c->nb[0] != sizeof(float) || m->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // tokens: one per threadgroup row, as long as the separate product would also take the plain one-column-per-
+    // threadgroup matvec (not the small-batch mv_ext, few-row MMA or matrix paths)
+    static const bool t1_only = getenv("GGML_METAL_GF_CTRL_T1") != nullptr;
+    const int64_t T = mm->ne[1];
+    if (T < 1 || T > 5 || x->ne[1] != T || ad->ne[1] != T || c->ne[1] != T || m->ne[1] != T || mm->ne[2] != 1 ||
+        (T > 1 && (w->ne[0] % 128 == 0 || ggml_metal_op_mul_mat_use_mma(mm) || t1_only))) {
+        return false;
+    }
+    for (int i = 0; i < 6; ++i) { // only the ADD leaves the group (the matvec output feeds the two TANH through views)
+        if (i == 0) {
+            continue;
+        }
+        if (ggml_node_get_use_count(gf, node_idxs[idx + i]) != 1) {
+            return false;
+        }
+    }
+    if (mm->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(ad, root(c)) || overlap(ad, root(m)) || overlap(ad, root(x))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// y = W^T (c * sigmoid(g)) at one token, W Q8_0 on the kernel_mul_mv_q8_0_f32 path (nsg 4, nr0 2): the gated input is
+// computed per element as kernel_gate_mul_f32 does and fed to an exact replica of the matvec
+static bool ggml_metal_fusion_check_gate_mv(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    if (!ggml_metal_fusion_check_gate_mul(fusion, nodes, gf, node_idxs, idx, mode)) {
+        return false;
+    }
+    const ggml_tensor * mul = nodes[1];
+    const ggml_tensor * mm  = nodes[2];
+    const ggml_tensor * w   = mm->src[0];
+    if (mm->src[1] != mul || w->type != GGML_TYPE_Q8_0 || mm->type != GGML_TYPE_F32 || mul->ne[1] != 1 ||
+        mul->ne[2] != 1 || mul->ne[3] != 1 || w->ne[0] != mul->ne[0] || w->ne[0] % 32 != 0 || w->ne[2] != 1 ||
+        w->ne[3] != 1 || mm->ne[1] != 1 || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(gf, node_idxs[idx]) != 1 || ggml_node_get_use_count(gf, node_idxs[idx + 1]) != 1) {
+        return false;
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        auto root = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
+        auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+            const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (overlap(mm, root(mul->src[0])) || overlap(mm, root(nodes[0]->src[0]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -827,6 +1984,46 @@ static const std::vector<ggml_op> ops_add_5 = { GGML_OP_ADD, GGML_OP_ADD, GGML_O
 static const std::vector<ggml_op> ops_add_6 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_add_7 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_OP_SQR, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_clip_rows        = { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                                                          GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_clip_rows_scaled = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                                                          GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+// raw order includes the VIEW of up (gate_up second half), which the graph visits right before its SCALE
+// raw order: the message VIEW (m) is visited right before its MUL when nothing read it earlier
+static const std::vector<ggml_op> ops_ctrl_mix      = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_ctrl_mix_nov  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_sconv = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
+                                                GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_sconv_res = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
+                                                    GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_relpos = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT,
+                                                 GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_ADD, GGML_OP_CPY };
+static const std::vector<ggml_op> ops_mix_tail = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_mix_tail_t = { GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_gate_mul = { GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_gate_mv  = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_cat_mv          = { GGML_OP_CONCAT, GGML_OP_MUL_MAT };
+static const std::vector<ggml_op> ops_gf_ctrl         = { GGML_OP_MUL_MAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                                                          GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_gf_ctrl_nov     = { GGML_OP_MUL_MAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                                                          GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_norm_concat     = { GGML_OP_RMS_NORM, GGML_OP_CONCAT };
+static const std::vector<ggml_op> ops_norm_concat_r   = { GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_CONCAT };
+static const std::vector<ggml_op> ops_mv_id_scale     = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_mv_id_scale_rep = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+// raw: CONCAT VIEW VIEW CPY SSM_CONV RESHAPE, lag 0 (window VIEW TRANSPOSE CONT RESHAPE, RESHAPE of the projection, tap VIEW,
+// MUL RESHAPE ADD), lags 1-3 (the projection reshape is visited already), ADD SCALE
+static const std::vector<ggml_op> ops_sconv_dyn = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_RESHAPE,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    GGML_OP_ADD, GGML_OP_SCALE };
+static const std::vector<ggml_op> ops_clip_store = { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL,
+                                                     GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+static const std::vector<ggml_op> ops_norm_store = { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+static const std::vector<ggml_op> ops_situ  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                                GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
@@ -878,6 +2075,28 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_ADD_CHAIN, ops_add_7, {}, false, ggml_metal_fusion_check_add_chain },
 
     { GGML_METAL_FUSION_SNAKE, ops_snake, {}, false, ggml_metal_fusion_check_snake },
+    { GGML_METAL_FUSION_SITU,  ops_situ,  {}, true,  ggml_metal_fusion_check_situ  },
+    { GGML_METAL_FUSION_CLIP_STORE, ops_clip_store, {}, true, ggml_metal_fusion_check_clip_store },
+    { GGML_METAL_FUSION_NORM_STORE, ops_norm_store, {}, true, ggml_metal_fusion_check_norm_store },
+    { GGML_METAL_FUSION_SCONV_DYN, ops_sconv_dyn, {}, true, ggml_metal_fusion_check_sconv_dyn },
+    { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail, {}, true,  ggml_metal_fusion_check_mix_tail },
+    { GGML_METAL_FUSION_MIX_TAIL, ops_mix_tail_t, {}, true, ggml_metal_fusion_check_mix_tail_t },
+    { GGML_METAL_FUSION_GATE_MV,  ops_gate_mv,  {}, true,  ggml_metal_fusion_check_gate_mv  },
+    { GGML_METAL_FUSION_GATE_MUL, ops_gate_mul, {}, false, ggml_metal_fusion_check_gate_mul },
+    { GGML_METAL_FUSION_CAT_MV,      ops_cat_mv,        {}, true, ggml_metal_fusion_check_cat_mv },
+    { GGML_METAL_FUSION_GF_CTRL,     ops_gf_ctrl,       {}, true, ggml_metal_fusion_check_gf_ctrl },
+    { GGML_METAL_FUSION_GF_CTRL,     ops_gf_ctrl_nov,   {}, true, ggml_metal_fusion_check_gf_ctrl },
+    { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat,   {}, true, ggml_metal_fusion_check_norm_concat },
+    { GGML_METAL_FUSION_NORM_CONCAT, ops_norm_concat_r, {}, true, ggml_metal_fusion_check_norm_concat },
+    { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale,     {}, true, ggml_metal_fusion_check_mv_id_scale },
+    { GGML_METAL_FUSION_MV_ID_SCALE, ops_mv_id_scale_rep, {}, true, ggml_metal_fusion_check_mv_id_scale },
+    { GGML_METAL_FUSION_RELPOS, ops_relpos, {}, true, ggml_metal_fusion_check_relpos },
+    { GGML_METAL_FUSION_SCONV, ops_sconv, {}, true,  ggml_metal_fusion_check_sconv },
+    { GGML_METAL_FUSION_SCONV, ops_sconv_res, {}, true, ggml_metal_fusion_check_sconv },
+    { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix,     {}, true, ggml_metal_fusion_check_ctrl_mix },
+    { GGML_METAL_FUSION_CTRL_MIX, ops_ctrl_mix_nov, {}, true, ggml_metal_fusion_check_ctrl_mix },
+    { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows,        {}, true, ggml_metal_fusion_check_clip_rows },
+    { GGML_METAL_FUSION_CLIP_ROWS, ops_clip_rows_scaled, {}, true, ggml_metal_fusion_check_clip_rows },
 
     { GGML_METAL_FUSION_GDN_CACHE, ops_gdn_cache, {}, true, ggml_metal_fusion_check_gdn_cache },
 
@@ -950,6 +2169,16 @@ static void ggml_metal_fusion_add_pattern_alloc_deps(
         }
         seen.insert(node);
     }
+
+    // the mix tail kernel reads the scores product (an inner node) while writing the output: keep it alive too
+    if (fusion->id == GGML_METAL_FUSION_MIX_TAIL) {
+        for (int j = 0; j < (int) fusion->ops_all.size(); ++j) {
+            if (fusion->ops_all[j] == GGML_OP_MUL_MAT) {
+                add_alloc_dep(user_data, gf->nodes[node_idx + j], gf->nodes[last_node]);
+                break;
+            }
+        }
+    }
 }
 
 void ggml_metal_fusion_add_alloc_deps(
@@ -974,6 +2203,29 @@ void ggml_metal_fusion_add_alloc_deps(
             ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, best, i);
             i += best_raw - 1;
         }
+    }
+
+    // inkling2 mix() for a token batch: before the reorder the queries REPEAT sits between the CONT and the scores
+    // product, so no raw pattern matches. The MIX_TAIL token-batch kernel reads the states and the scores while
+    // writing the output, so keep both alive until the output (found by structure, independent of node order).
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * mm2 = gf->nodes[i];
+        if (mm2->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        ggml_tensor * cont = mm2->src[0];
+        ggml_tensor * sm   = mm2->src[1];
+        if (cont == nullptr || sm == nullptr || cont->op != GGML_OP_CONT || sm->op != GGML_OP_SOFT_MAX || sm->src[1] != nullptr) {
+            continue;
+        }
+        ggml_tensor * tr  = cont->src[0];
+        ggml_tensor * mm1 = sm->src[0];
+        if (tr == nullptr || mm1 == nullptr || tr->op != GGML_OP_TRANSPOSE || mm1->op != GGML_OP_MUL_MAT ||
+            mm1->src[0] != tr->src[0] || tr->src[0]->ne[2] < 2) {
+            continue;
+        }
+        add_alloc_dep(user_data, tr->src[0], mm2);
+        add_alloc_dep(user_data, mm1, mm2);
     }
 }
 
@@ -1319,6 +2571,11 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
         int len = 1;
         const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs, n_idxs, i_f, GGML_METAL_FUSION_STRUCTURAL, &len);
         if (!fusion || total + len > GGML_METAL_FUSION_MAX) {
+            break;
+        }
+        // a single pattern may span up to GGML_METAL_FUSION_MAX raw nodes; chaining more patterns behind it stops at
+        // GGML_METAL_FUSION_CHAIN_MAX, and never cuts a pattern (a cut tail is packed apart and can be reordered)
+        if (i_f > 0 && idxs[i_f + len - 1] - idx + 1 > GGML_METAL_FUSION_CHAIN_MAX) {
             break;
         }
 
