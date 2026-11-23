@@ -16,7 +16,7 @@ template<
     typename SA, typename SA_4x4, typename SA_8x8,
     typename SB, typename SB_2x4, typename SB_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
-    typename T0, typename T0_4x4, typename T1, typename T1_2x4, short BX = N_MM_BLOCK_X>
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4, short BX = N_MM_BLOCK_X, short NK = N_MM_NK>
 kernel void kernel_mul_mm(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * srcA,
@@ -45,6 +45,8 @@ kernel void kernel_mul_mm(
     // hill-climb: BX < N_MM_BLOCK_X gives narrower token tiles (more threadgroups) for products with few output rows
     constexpr int NRB = SZ_SIMDGROUP * BX * N_MM_SIMD_GROUP_X;
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
+    // hill-climb: NK > N_MM_NK takes K in wider chunks (fewer barrier-bound steps) for products with few output rows
+    constexpr int NKT = SZ_SIMDGROUP * NK;
 
     // Tile offsets in output matrix
     const int ra = tgpig.y * NRA;
@@ -54,11 +56,11 @@ kernel void kernel_mul_mm(
     threadgroup SA * sa = (threadgroup SA *)(shmem);
 
     // Work-item count for A loading
-    constexpr int A_WORK_ITEMS = NRA * N_MM_NK;
+    constexpr int A_WORK_ITEMS = NRA * NK;
     constexpr int NUM_THREADS = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
 
     // tA wraps threadgroup memory
-    auto tA = tensor(sa, dextents<int32_t, 2>(N_MM_NK_TOTAL, NRA));
+    auto tA = tensor(sa, dextents<int32_t, 2>(NKT, NRA));
 
     // tB wraps device memory directly
     device T1 * ptrB = (device T1 *)(srcB + args.nb12*i12 + args.nb13*i13);
@@ -67,7 +69,7 @@ kernel void kernel_mul_mm(
 
     // Configure matmul operation
     // note: K is dynamic_extent (clamped to the valid range in PHASE 2), since a static
-    //       N_MM_NK_TOTAL K tile would read src1 out of bounds when K % N_MM_NK_TOTAL != 0
+    //       NKT K tile would read src1 out of bounds when K % NKT != 0
     // ref: https://github.com/ggml-org/llama.cpp/pull/27064
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
@@ -78,11 +80,11 @@ kernel void kernel_mul_mm(
     auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     // Accumulate partial results over K dimension
-    for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
+    for (int loop_k = 0; loop_k < K; loop_k += NKT) {
         // === PHASE 1: Dequantization of A into threadgroup memory ===
         for (int work = tiitg; work < A_WORK_ITEMS; work += NUM_THREADS) {
-            const int row = work / N_MM_NK;
-            const int k_chunk = work % N_MM_NK;
+            const int row = work / NK;
+            const int k_chunk = work % NK;
             const int k_pos = loop_k + k_chunk * 16;
             const short k_base = k_chunk * 16;
 
@@ -96,7 +98,7 @@ kernel void kernel_mul_mm(
                     device const T0 * row_ptr = (device const T0 *)(srcA + args.nb01 * (ra + row) + offset0);
 
                     FOR_UNROLL (short i = 0; i < 16; i++) {
-                        sa[row * N_MM_NK_TOTAL + (k_base + i)] = (k_pos + i < K) ? (SA) row_ptr[k_pos + i] : (SA)0;
+                        sa[row * NKT + (k_base + i)] = (k_pos + i < K) ? (SA) row_ptr[k_pos + i] : (SA)0;
                     }
                 } else {
                     const int block_idx = k_pos / (16 * nl);
@@ -109,13 +111,13 @@ kernel void kernel_mul_mm(
 
                     FOR_UNROLL (short i = 0; i < 16; i++) {
                         // Zero-pad A for K positions beyond valid range (handles partial K iterations)
-                        sa[row * N_MM_NK_TOTAL + (k_base + i)] = (k_pos + i < K) ? temp_a[i/4][i%4] : (SA)0;
+                        sa[row * NKT + (k_base + i)] = (k_pos + i < K) ? temp_a[i/4][i%4] : (SA)0;
                     }
                 }
             } else {
                 // Zero-pad rows beyond matrix bounds
                 FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa[row * N_MM_NK_TOTAL + (k_base + i)] = (SA)0;
+                    sa[row * NKT + (k_base + i)] = (SA)0;
                 }
             }
         }
@@ -125,9 +127,9 @@ kernel void kernel_mul_mm(
         // === PHASE 2: Tensor matmul ===
         // Clamp the K extent of both operand tensors to the remaining valid K range so
         // the dynamic-K op never reads past the K extent of src1 (or the staged A tile).
-        const int kExt = min(N_MM_NK_TOTAL, K - loop_k);
+        const int kExt = min(NKT, K - loop_k);
 
-        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
+        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, NKT}));
         auto tBv = tensor(ptrB + loop_k + rb * strideB, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
 
         mm.run(tBv, tAv, cT);
@@ -928,6 +930,9 @@ template [[host_name("kernel_mul_mm_q8_0_f32")]]    kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_f32_f32_bx1")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4, 1>;
 template [[host_name("kernel_mul_mm_f16_f32_bx1")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4, 1>;
 template [[host_name("kernel_mul_mm_q8_0_f32_bx1")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  float, float2x4, 1>;
+template [[host_name("kernel_mul_mm_f32_f32_bx1k8")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4, 1, 8>;
+template [[host_name("kernel_mul_mm_f16_f32_bx1k8")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4, 1, 8>;
+template [[host_name("kernel_mul_mm_q8_0_f32_bx1k8")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q8_0,    2,     dequantize_q8_0,    float,  float4x4,  float, float2x4, 1, 8>;
 #endif
 template [[host_name("kernel_mul_mm_mxfp4_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_mxfp4,   2,     dequantize_mxfp4,   float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q2_K_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q2_K,    QK_NL, dequantize_q2_K,    float,  float4x4,  float, float2x4>;

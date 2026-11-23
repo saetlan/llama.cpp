@@ -984,6 +984,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_Q8_0) && tsrc1 == GGML_TYPE_F32;
     const int NRB = narrow ? NRB1 : NRB4;
 
+    // hill-climb: few-row products are bound by their serial K loop (two barriers per K step), so the narrow tiles take
+    // K in steps of 8*SZ_SIMDGROUP; GGML_METAL_MM_NARROW_NK=2 restores the default step (same results either way)
+    static const int narrow_nk = [] {
+        const char * s = getenv("GGML_METAL_MM_NARROW_NK");
+        return (s && atoi(s) == N_MM_NK) ? N_MM_NK : 8;
+    }();
+    const int nk = narrow ? narrow_nk : N_MM_NK;
+    char nk_suffix[8] = "";
+    if (nk != N_MM_NK) {
+        snprintf(nk_suffix, sizeof(nk_suffix), "k%d", nk);
+    }
+
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
@@ -994,7 +1006,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), narrow ? "_bx1" : "");
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), narrow ? "_bx1" : "", nk_suffix);
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -1018,7 +1030,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.nr0 = NRA;
         res.nr1 = NRB;
 
-        const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
+        const size_t smem_a = NRA * (SZ_SIMDGROUP * nk) * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else {
         res.nr0 = 64;
