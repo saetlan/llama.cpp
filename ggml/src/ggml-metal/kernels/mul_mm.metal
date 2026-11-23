@@ -9,6 +9,7 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
 constant bool    FC_mul_mm_id_wscale    [[function_constant(FC_MUL_MM + 9)]]; // hill-climb: dst row *= wscale[expert]
+constant bool    FC_mul_mm_id_nr64      [[function_constant(FC_MUL_MM + 10)]]; // hill-climb: 64-entry tiles (tensor path)
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -426,7 +427,7 @@ kernel void kernel_mul_mm_id_map0(
     // every slice is padded by one entry for the uniform dummy store of pass 2 - and emit the
     // entry tile descriptors of kernel_mul_mm_id: (expert, first entry, valid rows) per tile
     if (tpitg == 0) {
-        constexpr uint32_t NTILE = 32; // must match NR1 of kernel_mul_mm_id
+        const uint32_t NTILE = FC_mul_mm_id_nr64 ? 64 : 32; // must match NR1 of kernel_mul_mm_id
 
         uint32_t base = 0;
         uint32_t tile = 0;
@@ -571,7 +572,9 @@ kernel void kernel_mul_mm_id(
 #endif
 
     constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
+    // hill-climb: with the tensor API an entry tile can hold 64 entries (four 16-entry products on one staged A tile),
+    // so an expert with 33..64 entries reads its weights once instead of twice
+    const     int NR1 = FC_mul_mm_id_nr64 ? 64 : 32;
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
@@ -611,7 +614,7 @@ kernel void kernel_mul_mm_id(
     const short iy = 8*(tiitg % NL1);
 
     // skip the upper half of the token tile when the expert did not fill it
-    constexpr short NR1H = NR1/2;
+    constexpr short NR1H = 16;
 
 #ifndef GGML_METAL_HAS_TENSOR
     S0_8x8 ma[4];
@@ -624,6 +627,8 @@ kernel void kernel_mul_mm_id(
     // sb is [NR1][NK] row-major
     auto tB0 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb,             dextents<int32_t, 2>(NK, NR1H));
     auto tB1 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + NR1H*NK,   dextents<int32_t, 2>(NK, NR1H));
+    auto tB2 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + 2*NR1H*NK, dextents<int32_t, 2>(NK, NR1H));
+    auto tB3 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + 3*NR1H*NK, dextents<int32_t, 2>(NK, NR1H));
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(NR1H, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
@@ -650,6 +655,19 @@ kernel void kernel_mul_mm_id(
 
     const bool has_hi = nr1 > NR1H;
 
+#ifdef GGML_METAL_HAS_TENSOR
+    // entries 32..63 of a 64-entry tile: same columns of src1, second staging half of sb
+    const bool  has_q2 = nr1 > 2*NR1H;
+    const bool  has_q3 = nr1 > 3*NR1H;
+    const short lr1b   = (lr1 + 32 < nr1) ? lr1 + 32 : nr1 - 1;
+    const int   idb2   = has_q2 ? ids_i32[idb + lr1b] : id;
+    device const T1 * y2 = (device const T1 *)(src1
+        + args.nb13*i13
+        + args.nb12*(idb2 / args.ne20)
+        + args.nb11*((idb2 % args.ne20) % args.ne11)
+        + args.nb10*iy);
+#endif
+
 #ifndef GGML_METAL_HAS_TENSOR
     for (short i = 0; i < 8; i++){
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
@@ -660,6 +678,8 @@ kernel void kernel_mul_mm_id(
 #else
     auto cT0 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB0), float>();
     auto cT1 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB1), float>();
+    auto cT2 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB2), float>();
+    auto cT3 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB3), float>();
 #endif
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
@@ -780,6 +800,9 @@ kernel void kernel_mul_mm_id(
                 //const short ly = i;
 
                 *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                if (has_q2) {
+                    *(sb + NK*(32 + 8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y2 + i) : 0;
+                }
             }
         } else {
             const short sx = (tiitg%NL1);
@@ -791,6 +814,9 @@ kernel void kernel_mul_mm_id(
             //const short ly = i;
 
             *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y));
+            if (has_q2) {
+                *(threadgroup S1_2x4 *)(sb + NK*(32 + 8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y2));
+            }
         }
 #endif
 
@@ -798,6 +824,9 @@ kernel void kernel_mul_mm_id(
         x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
 
         y += NK;
+#ifdef GGML_METAL_HAS_TENSOR
+        y2 += NK;
+#endif
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -841,6 +870,16 @@ kernel void kernel_mul_mm_id(
 
             mm.run(sB1, sA, cT1);
         }
+        if (has_q2) {
+            auto sB2 = tB2.slice(0, 0);
+
+            mm.run(sB2, sA, cT2);
+        }
+        if (has_q3) {
+            auto sB3 = tB3.slice(0, 0);
+
+            mm.run(sB3, sA, cT3);
+        }
 #endif
     }
 
@@ -865,9 +904,33 @@ kernel void kernel_mul_mm_id(
     }
 #endif
 
+    // the staging buffer holds 32 entries: a 64-entry tile is written in two halves
+#ifdef GGML_METAL_HAS_TENSOR
+    const short n_half = has_q2 ? 2 : 1;
+#else
+    const short n_half = 1;
+#endif
+
+    for (short h = 0; h < n_half; ++h) {
+#ifdef GGML_METAL_HAS_TENSOR
+    if (h == 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto tC2 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc,             dextents<int32_t, 2>(NR0, NR1H));
+        cT2.store(tC2);
+
+        if (has_q3) {
+            auto tC3 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc + NR1H*NR0, dextents<int32_t, 2>(NR0, NR1H));
+            cT3.store(tC3);
+        }
+    }
+#endif
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (short j = sgitg; j < nr1; j += 4) {
+    const short j_end = nr1 < 32*(h + 1) ? nr1 : 32*(h + 1);
+
+    for (short j = 32*h + sgitg; j < j_end; j += 4) {
         const int id = ids_i32[idb + j];
 
         const short ide = id % args.ne20;
@@ -876,7 +939,7 @@ kernel void kernel_mul_mm_id(
         device float  * D  = (device float  *) dst + r0 + (uint64_t) ide*args.ne0 + (uint64_t) idt*args.ne1*args.ne0;
         device float4 * D4 = (device float4 *) D;
 
-        threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
+        threadgroup float  * C  = (threadgroup float  *) shmem + (j - 32*h)*NR0;
         threadgroup float4 * C4 = (threadgroup float4 *) C;
 
         if (FC_mul_mm_id_wscale) {
@@ -903,6 +966,7 @@ kernel void kernel_mul_mm_id(
                 *(D + i) = *(C + i);
             }
         }
+    }
     }
 }
 
