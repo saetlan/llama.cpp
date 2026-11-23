@@ -1957,16 +1957,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
     return res;
 }
 
-const char * ggml_metal_fa_tensor_cfg(int dk, int dv, bool f16, int * nqptg, int * nsg) {
+bool ggml_metal_fa_tensor_q16(int dk, int dv, bool f16, int64_t ne11) {
     // 16 queries per threadgroup: ~10 KB of threadgroup memory instead of ~20 KB, so 2-3 threadgroups share a core
-    // (prefill +3% at 4k-16k context on an M5 Pro); same results, since each row's online softmax is unchanged
+    // (prefill +3-5% at 4k-16k context on an M5 Pro); past ~24k of KV every threadgroup re-reads the whole K/V from
+    // memory and the 32-query tile is faster again (-3% at 32k, -9% at 64k with 16). Each row's online softmax is
+    // the same in both tiles, so the choice does not change the results
     static const bool q32 = getenv("GGML_METAL_FA_TENSOR_Q32") != nullptr;
-    if (q32 || dk != 128 || dv != 128 || !f16) {
-        return "";
-    }
-    if (nqptg) { *nqptg = 16; }
-    if (nsg)   { *nsg   = 8;  }
-    return "_q16s8";
+    return !q32 && dk == 128 && dv == 128 && f16 && ne11 <= 24576;
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_tensor(
@@ -1975,7 +1972,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         bool has_mask,
         bool has_sinks,
         bool has_bias,
-        bool has_scap) {
+        bool has_scap,
+        bool q16) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1986,9 +1984,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
 
     const char * type = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
 
-    const char * cfg_sfx = ggml_metal_fa_tensor_cfg(dk, dv, op->src[1]->type == GGML_TYPE_F16, nullptr, nullptr);
-
-    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d%s", type, dk, dv, cfg_sfx);
+    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d%s", type, dk, dv, q16 ? "_q16s8" : "");
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d", base, has_mask, has_sinks, has_bias, has_scap);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

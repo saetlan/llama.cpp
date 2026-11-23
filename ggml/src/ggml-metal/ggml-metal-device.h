@@ -208,9 +208,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t nqptg,
         int32_t ncpsg);
 
-// hill-climb: tensor FA tile for f16 dk = dv = 128 (16 queries per threadgroup; GGML_METAL_FA_TENSOR_Q32=1 restores 32)
-// returns the instance suffix ("" for the stock tile) and sets the queries per threadgroup and simdgroups
-const char * ggml_metal_fa_tensor_cfg(int dk, int dv, bool f16, int * nqptg, int * nsg);
+// hill-climb: the tensor FA takes 16 queries per threadgroup for f16 dk = dv = 128 when the KV is at most 24k long
+// (GGML_METAL_FA_TENSOR_Q32=1 always uses the stock 32-query tile); same results either way
+bool ggml_metal_fa_tensor_q16(int dk, int dv, bool f16, int64_t ne11);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_tensor(
         ggml_metal_library_t lib,
@@ -218,7 +218,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool has_mask,
         bool has_sinks,
         bool has_bias,
-        bool has_scap);
+        bool has_scap,
+        bool q16);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_library_t lib,
