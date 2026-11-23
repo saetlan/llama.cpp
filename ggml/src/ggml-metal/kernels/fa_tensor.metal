@@ -283,6 +283,9 @@ typedef decltype(kernel_flash_attn_ext_tensor<half, half4, 64, 64>) flash_attn_e
 
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk64_dv64"  )]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 64,  64>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk128_dv128")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 128, 128>;
+// hill-climb: 16 queries per threadgroup for dk = dv = 128 (half the threadgroup memory, more threadgroups per core;
+// per-row math unchanged: same C, same lanes, rows that do not rescale are multiplied by exactly 1)
+template [[host_name("kernel_flash_attn_ext_tensor_f16_dk128_dv128_q16s8")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 128, 128, 16, 64, 8>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk192_dv128")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 192, 128>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk256_dv256")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 256, 256>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk512_dv512")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 512, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;

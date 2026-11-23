@@ -1957,6 +1957,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
     return res;
 }
 
+const char * ggml_metal_fa_tensor_cfg(int dk, int dv, bool f16, int * nqptg, int * nsg) {
+    // 16 queries per threadgroup: ~10 KB of threadgroup memory instead of ~20 KB, so 2-3 threadgroups share a core
+    // (prefill +3% at 4k-16k context on an M5 Pro); same results, since each row's online softmax is unchanged
+    static const bool q32 = getenv("GGML_METAL_FA_TENSOR_Q32") != nullptr;
+    if (q32 || dk != 128 || dv != 128 || !f16) {
+        return "";
+    }
+    if (nqptg) { *nqptg = 16; }
+    if (nsg)   { *nsg   = 8;  }
+    return "_q16s8";
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_tensor(
         ggml_metal_library_t lib,
         const ggml_tensor * op,
@@ -1974,7 +1986,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
 
     const char * type = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
 
-    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d", type, dk, dv);
+    const char * cfg_sfx = ggml_metal_fa_tensor_cfg(dk, dv, op->src[1]->type == GGML_TYPE_F16, nullptr, nullptr);
+
+    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d%s", type, dk, dv, cfg_sfx);
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d", base, has_mask, has_sinks, has_bias, has_scap);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
