@@ -2,7 +2,7 @@
 
 This fork branch (`inkling-hc`) makes [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) run
 faster on llama.cpp's Metal backend. The work was done on an Apple M5 Pro with 64 GB of unified memory, over
-21–22 Nov 2026, starting from upstream master `418fe97`. It is not submitted upstream.
+21–23 Nov 2026, starting from upstream master `418fe97`. It is not submitted upstream.
 
 The model is a looped MoE. Its 24 layers run as 48 passes, with 128 routed experts (8 active) and a learned
 relative-position attention bias. In stock llama.cpp that means many small kernels per token and a large attention
@@ -21,13 +21,36 @@ The work was AI-assisted (Claude Code), and every change was measured on this ma
 
 ## Results
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/saetlan/llama.cpp/inkling-hc/docs/img/inkling-hillclimb-dark.svg">
+  <img alt="Hill-climb chart: speed after each step relative to stock llama.cpp. Prefill reaches 3.1 to 3.7 times stock, single-user decode 1.7 times." src="https://raw.githubusercontent.com/saetlan/llama.cpp/inkling-hc/docs/img/inkling-hillclimb-light.svg">
+</picture>
+
+| llama-server on an M5 Pro | stock llama.cpp | this branch | gain |
+|---|---|---|---|
+| decode, 1 user | 29.1 t/s | **49.2 t/s** | +69% |
+| decode, 2 users (total) | 40.7 t/s | **67.7 t/s** | +66% |
+| prefill, 3.3k-token prompt | 386 t/s | **1183 t/s** | ×3.1 |
+| prefill, 12.9k-token prompt | 312 t/s | **1163 t/s** | ×3.7 |
+
+Each number is the mean of 6 runs; the standard deviation is at most 0.5% of the mean for every one. Settings: 131k
+context, 2 slots, flash attention on. From step 3 on, every change keeps the outputs bit-identical (see Exactness).
+
+- **Opt-in fast setup:** prefill another +5–6% (1238 and 1232 t/s), same decode, outputs not bit-identical. Flags:
+  `-ub 1024 --cache-ram 4096` plus `GGML_METAL_MMID_MIN_T=6`.
+- **Long prompts:** a 119k-token prompt prefills at 624 t/s, against 544 for `703cd33` and 174 for the day-1 build.
+- **Speculative decoding** is not in these numbers. With `--spec-type ngram-mod` (lossless), file edits run at 78–137
+  t/s.
+
+<details><summary>Method, uncertainty and raw runs</summary>
+
 One session on the morning of 23 Nov 2026, on a quiet machine. Setups ran in the order A B C D D C B A, three times
 over, so each ran six times. Settings: llama-server, 131k context, 2 slots, flash attention on. Each run takes the
-median of 6 decode samples. The branch columns used `213ae99`; the one later change (`dc7339e`) only affects 6–31-token
-batches (below). The previous published numbers (`703cd33`) are in the second column for comparison.
+median of 6 decode samples. The exact and fast columns used `213ae99`; the one later change (`dc7339e`) only affects
+6–31-token batches (below). The previous published numbers (`703cd33`) are in the second column for comparison.
 
-Speeds are the mean of the six runs ± their standard deviation, the convention llama-bench uses. With six runs,
-mean ± sd is also very close to a 95% confidence interval for the mean.
+Speeds are the mean of the six runs ± their standard deviation, the convention llama-bench uses. With six runs, mean ±
+sd is also very close to a 95% confidence interval for the mean.
 
 | t/s, n = 6 | stock `418fe97` + Q8_0 | branch at `703cd33` | this branch, exact (default) | this branch, fast (opt-in) |
 |---|---|---|---|---|
@@ -55,7 +78,7 @@ freedom.
   direction (code generation and memory layout).
 - The fast setup swapped 2.4 GB in one of its six runs (46 GiB of GPU memory with other apps open).
 
-<details><summary>Raw values (run order)</summary>
+**Raw values (run order)**
 
 | t/s | stock + Q8_0 | exact | fast |
 |---|---|---|---|
@@ -64,43 +87,40 @@ freedom.
 | prefill, 3.3k-token prompt | 382 / 387 / 387 / 386 / 387 / 386 | 1184 / 1178 / 1182 / 1184 / 1184 / 1184 | 1241 / 1250 / 1233 / 1258 / 1213 / 1234 |
 | prefill, 12.9k-token prompt | 311 / 312 / 312 / 312 / 313 / 312 | 1164 / 1163 / 1165 / 1163 / 1162 / 1163 | 1227 / 1232 / 1232 / 1232 / 1233 / 1234 |
 
-</details>
-
 Other measurements of the exact build (separate runs):
 
 - llama-bench pp512: 1289 t/s; at 64k of context about 570 t/s.
-- A 119k-token needle prompt prefills at 624 t/s, against 544 for `703cd33` and 174 for the day-1 build.
 - Short batches at 4k of context (`dc7339e`): 16 tokens 157.5 t/s, 24 tokens 153 t/s (+8% over `213ae99`).
 
-These numbers don't include speculative decoding. With `--spec-type ngram-mod` (lossless), file edits and rewrites
-run at 78–137 t/s.
-
 Both branch columns use the ggml-org Q8_0 with the routed experts of layers 0–19 replaced by the released NVFP4
-tensors, taken unchanged from Unsloth's UD-Q8_K_XL. Layers 20–23 keep Q8_0, because their originals are MXFP8.
-That file needs the NVFP4 `MUL_MAT_ID` kernels from this branch. The plain Q8_0 also works.
+tensors, taken unchanged from Unsloth's UD-Q8_K_XL. Layers 20–23 keep Q8_0, because their originals are MXFP8. That
+file needs the NVFP4 `MUL_MAT_ID` kernels from this branch. The plain Q8_0 also works.
+
+</details>
 
 ### Where the gains came from
 
-Each step was measured against the build before it, in the same session:
+Each point in the chart is a packaged build of this branch, run with the same harness as the table above: mean of 2
+runs per build in mirrored order, on the afternoon of 23 Nov. The last row can differ from the 6-run table above by up
+to 0.5%. Stock and step 1 use the plain Q8_0; the step-9 point is `a4b4322`, before the 24k cut-off of `7ad391f`,
+which changes nothing at these prompt sizes.
 
-| Step | What changed | Effect |
-|---|---|---|
-| 1. Day 1, kernels only, Q8_0 | Graph dedup across loop passes, 12 Metal fusions, packed projections, wider reorder | decode 29.2 → 39.1 t/s; prefill 387 → 562 (4k), 312 → 459 (16k) |
-| 2. NVFP4 experts | Released NVFP4 expert tensors, Metal NVFP4 `MUL_MAT_ID`, rel-pos mask from a bias table, one-token fusions | decode → 49.2; 2 users → 64.0; prefill → 863 (4k), 830 (16k) |
-| 3. Prompt batches | Depth-mix tail for token batches, faster rel-pos mask kernel | prefill +11% (4k), +15% (16k); 2 users +3%; llama-bench pp512 929 → 1112 |
-| 4. Two users | Fusions also fire for 2 sequences and for small batches | 2 users +2.8% (65.4 → 67.2) |
-| 5. Short conv | Removed a 64-bit index division per thread in the prompt-batch short conv | prefill +3.3% (1006 → 1039 at 4k) |
-| 6. Narrow tiles | 32-token tiles for tensor-API matmuls with few output rows | llama-bench pp512 1162 → 1183 (+1.8%) |
-| 7. K steps | Few-row matmuls (sinks, loop control, router) take K in steps of 128 | +0.5% prefill |
-| 8. Expert tiles 64 | Expert matmul with 64-entry tiles: weights read once per 64 tokens | +1.8% prefill |
-| 9. FA tiles | Flash attention with 16 queries per threadgroup while KV ≤ 24k (more threadgroups per core) | +3.5–4% at 4k–16k |
-| 10. Rel-pos mask | Mask kernel with 2 heads per threadgroup (8 KB table, 3 threadgroups per core) | +2.8% (+4.2% at 4k) |
-| 11. Block scan | Flash-attention block scan on the shared base mask instead of every head's mask | +0.8% at 4k, +5% at 64k |
-| 12. Expert rows 128 | Expert matmul with 128 weight rows per threadgroup (8 simdgroups) | +1.3% prefill |
-| 13. Short batches | Expert matvec for 6–31 tokens: each expert's tokens in one threadgroup, weights from cache | +4–8.5% on 6–31-token batches |
+| Step | What changed | Prefill, 3.3k / 12.9k | Decode, 1 user |
+|---|---|---|---|
+| stock `418fe97` | upstream master, plain Q8_0 | 384 / 310 t/s | 29.1 t/s |
+| 1. day-1 fusions | Graph dedup across loop passes, 12 Metal fusions, packed projections, wider reorder (plain Q8_0) | 559 / 458 t/s | 39.0 t/s |
+| 2. NVFP4 experts | Released NVFP4 expert tensors with Metal NVFP4 `MUL_MAT_ID`, rel-pos mask from a bias table, one-token fusions | 863 / 830 t/s | 49.0 t/s |
+| 3. prompt batches | Depth-mix tail for token batches, faster rel-pos mask kernel | 1013 / 978 t/s | 49.0 t/s |
+| 4. 2-user fusions | Fusions also fire for 2 sequences and small batches (2-user decode 65.5 → 67.5 t/s) | 1011 / 975 t/s | 49.1 t/s |
+| 5. short conv | No 64-bit index division in the prompt-batch short conv | 1045 / 1009 t/s | 49.3 t/s |
+| 6. narrow tiles | 32-token tiles for tensor-API matmuls with few output rows | 1067 / 1028 t/s | 49.3 t/s |
+| 7–8. expert tiles | Few-row matmuls take K in steps of 128; expert matmul with 64-entry tiles | 1086 / 1049 t/s | 49.3 t/s |
+| 9. FA tiles | Flash attention with 16 queries per threadgroup up to 24k of KV | 1115 / 1088 t/s | 49.2 t/s |
+| 10–11. mask + block scan | Rel-pos mask with 2 heads per threadgroup; flash-attention block scan on the shared base mask | 1167 / 1147 t/s | 49.3 t/s |
+| 12. expert rows | Expert matmul with 128 weight rows per threadgroup | 1186 / 1164 t/s | 49.3 t/s |
+| 13. short batches | Expert matvec groups each expert's tokens for 6–31-token batches (+4–8.5% there, not visible at these prompt sizes) | 1185 / 1166 t/s | 49.2 t/s |
 
-Steps 3–13 keep the model's outputs bit-identical. Single-user decode stayed flat after step 2: it was already near
-its limit (see Limits).
+Single-user decode stayed flat after step 2: it was already near its limit (see Limits).
 
 ## Exactness
 
