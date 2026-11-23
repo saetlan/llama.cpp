@@ -110,7 +110,9 @@ of these:
 - a wikitext KLD run identical to every printed digit;
 - greedy panels with top-5 logprobs;
 - a fixed 20.8k-token greedy run;
-- perplexity at 2-, 3-, 4- and 512-token batches;
+- perplexity at 2-, 3-, 4-, 8-, 16-, 24- and 512-token batches;
+- for the changes that touch long context or small batches, perplexity at 8k and 32k of context and at 8-, 16-
+  and 24-token batches with the change on and off, identical per chunk;
 - `test-backend-ops`.
 
 Some day-1 fusions change rounding. Against the Q8_0 logits on wikitext, KLD is 0.0015 on the prefill path and
@@ -120,11 +122,12 @@ differences into visible greedy divergence.
 The fast column is opt-in and changes rounding: `-ub 1024 --cache-ram 4096` plus `GGML_METAL_MMID_MIN_T=6`.
 
 - KLD against the exact path is 0.0002.
-- Prefill: +4% (95% CI 0 to +8%) at 12.9k tokens in the table above, and +7% in llama-bench pp4096.
+- Prefill: +5% at 3.3k tokens and +6% at 12.9k in the table above (95% CI +3 to +6% and +6 to +6%).
 - Follow-up prompts of 6–31 tokens run 12–64% faster.
-- GPU peak is 46 GiB instead of 35 GiB.
+- GPU memory is about 46 GiB instead of 34 GiB.
 
-Qualified: a 119k-token needle found 3/3; two concurrent ~55k-token needles found 6/6; GPU peak 35 GiB; no swap.
+Qualified at `dc7339e`: a 119k-token needle found 3/3 (prefill 624 t/s); two concurrent ~55k-token needles found
+6/6; GPU peak 33 GiB; no swap. The full `test-backend-ops` suite on Metal passes (19,782 of 19,782).
 
 ## What is in the branch
 
@@ -161,7 +164,19 @@ Most of these have a `GGML_METAL_<NAME>_DISABLE` switch and a `test-backend-ops`
 - The graph reorder can move across plain CONCAT, SQR, SQRT, FILL, PAD and SOFT_MAX nodes, with a bounded
   lookahead so time to first token doesn't grow.
 - Tensor-API matmuls with few output rows use 32-token tiles instead of 128. Set `GGML_METAL_MM_NARROW_DISABLE` to
-  turn it off.
+  turn it off. Those tiles take K in steps of 128 instead of 32 (`GGML_METAL_MM_NARROW_NK=2` restores 32).
+- Tensor-API `mul_mm_id` (expert matmul) uses 64-entry tiles, so each expert's weights are read once per 64 tokens,
+  and 128 weight rows per threadgroup with 8 simdgroups (`GGML_METAL_MMID_NR64_DISABLE`,
+  `GGML_METAL_MMID_R128_DISABLE`).
+- Tensor flash attention takes 16 queries per threadgroup for f16 with dk = dv = 128 while the KV is at most 24k
+  long, and keeps the 32-query tile past that (`GGML_METAL_FA_TENSOR_Q32` forces 32).
+- The flash-attention block scan reads the shared F32 base mask once instead of every head's mask, when the mask is
+  built from a bias table (`GGML_METAL_FA_BLK_BM_DISABLE`).
+- The rel-pos mask kernel handles 2 heads per threadgroup for prompt batches (8 KB table, 3 threadgroups per core;
+  `GGML_METAL_RELPOS_HG=4` restores 4).
+- For 6–31-token batches, the NVFP4 expert matvec runs all of an expert's tokens in one threadgroup with the
+  unchanged single-token code, so the weights come from cache after the first token (`GGML_METAL_MVID_GROUP_DISABLE`).
+- All of these keep outputs bit-identical; each has the switch shown to turn it off.
 - Profiling switches:
   - `GGML_METAL_OPPROF=1`: GPU time per op group;
   - `GGML_METAL_OP_TWICE=<pattern>`: encodes matching groups twice, to measure their cost inside the pipeline;
@@ -187,8 +202,8 @@ For the fast setup, add `-ub 1024 --cache-ram 4096` and set `GGML_METAL_MMID_MIN
   The graph-level changes also affect other backends, but they were not tested there.
 - Single-user decode is close to its practical limit for exact kernels. Each token still runs about 1,750 dependent
   kernels at roughly 4–5 µs each, and the weight kernels already run near bandwidth.
-- The fast setup needs about 11 GiB more GPU memory. With other apps open it caused 140–470 MiB of swap in 3 of its 6
-  runs above; the exact build caused none.
+- The fast setup needs about 12 GiB more GPU memory. With other apps open it swapped 2.4 GB in one of its six runs
+  above; the exact build caused none.
 - The relative-position bias inside flash attention (upstream PR 32740 plus a Metal port) lives in a separate local
   branch. It saves about 11 GiB of compute buffer but is slower at prefill than this branch's mask kernel.
 - The DSpark drafter is still 12–40% slower than plain decoding on this machine.
